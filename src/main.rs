@@ -7,6 +7,7 @@ use std::str;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 enum SystemMessage {
     Close
@@ -125,9 +126,11 @@ fn main() {
     let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
+    let max_timeout : u64 = 10;
+
     let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, port); });
     let loop_handle = thread::spawn(move || { 
-        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, config.peers.iter().filter(|p| **p != port).collect()); 
+        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, config.peers.iter().filter(|p| **p != port).collect(), &max_timeout); 
     });
 
     let mut buffer = String::new();
@@ -195,11 +198,62 @@ fn serialize(message : &RaftMessage) -> String {
     }
 }
 
-fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, peers: Vec<&i32>) {
+struct FollowerData {
+    timeout: Instant
+}
+
+struct CandidateData {
+
+}
+
+struct LeaderData {
+
+}
+
+enum Role {
+    Follower(FollowerData),
+    Candidate(CandidateData),
+    Leader(LeaderData)
+}
+
+fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, max_timeout: &u64) -> Role {
+
+    if let Ok(msg) = inbound_channel.try_recv() {
+        println!("Received");
+    }
+
+    if follower.timeout.elapsed().as_secs() > *max_timeout {
+        println!("Timeout!");
+        Role::Candidate(CandidateData{})
+    } else {
+        println!("Timeout in {}", *max_timeout - follower.timeout.elapsed().as_secs());
+        Role::Follower(follower)
+    }
+}
+
+fn tick(role: Role, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, max_timeout: &u64) -> Role {
+    match role {
+        Role::Follower(data) => {
+            tick_follower(data, inbound_channel, outbound_channel, max_timeout)
+        }
+        Role::Candidate(_) => {
+            println!("Candidate");
+            role
+        }
+        Role::Leader(_) => {
+            println!("Leader");
+            role
+        }
+    }
+}
+
+fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, peers: Vec<&i32>, max_timeout: &u64) {
 
     let peers : Vec<String> = peers.iter().map(|p| format!("127.0.0.1:{}", p)).collect();
 
-    let mut i = 1;
+//    let mut i = 1;
+
+    let mut role = Role::Follower(FollowerData{ timeout: Instant::now() });
 
     loop {
         if let Ok(_) = system_channel.try_recv() {
@@ -207,19 +261,21 @@ fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mps
             break;
         }
 
-        if let Ok(msg) = inbound_channel.try_recv() {
-            println!("Main received: {} from {}", msg.raft_message, msg.address);
-        }
+        role = tick(role, &inbound_channel, &outbound_channel, max_timeout);
 
-        let msg = RaftMessage::HeartBeat(i);
+//        if let Ok(msg) = inbound_channel.try_recv() {
+//            println!("Main received: {} from {}", msg.raft_message, msg.address);
+//        }
 
-        for peer in &peers {
-            println!("Main sent: {} to {}", &msg, peer);
+//        let msg = RaftMessage::HeartBeat(i);
 
-            outbound_channel.send(DataMessage { raft_message: msg.clone(), address: peer.clone() }).unwrap();
-        }
+//        for peer in &peers {
+//            println!("Main sent: {} to {}", &msg, peer);
 
-        i = i + 1;
+//            outbound_channel.send(DataMessage { raft_message: msg.clone(), address: peer.clone() }).unwrap();
+//        }
+
+//        i = i + 1;
 
         thread::sleep(Duration::from_millis(1000));
     }
