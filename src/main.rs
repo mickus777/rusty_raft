@@ -35,13 +35,13 @@ enum SystemMessage {
 }
 
 enum RaftMessage {
+    RequestVote(RequestVoteData),
     HeartBeat(u64),
     AcceptCandidate(i32),
-    RejectCandidate(i32),
-    Candidacy(CandidacyData)
+    RejectCandidate(i32)
 }
 
-struct CandidacyData {
+struct RequestVoteData {
     candidate: i32,
     term: u64
 }
@@ -206,7 +206,7 @@ fn parse(message : &str) -> RaftMessage {
     match msg {
         Value::Object(map) => {
             if let Some(candidate) = map.get("candidacy") {
-                RaftMessage::Candidacy(CandidacyData { 
+                RaftMessage::RequestVote(RequestVoteData {
                     candidate: parse_i32(candidate.get("candidate").unwrap()), 
                     term: parse_u64(candidate.get("term").unwrap())
                 })
@@ -255,11 +255,11 @@ fn serialize(message : &RaftMessage) -> String {
                 })
             }).to_string()
         },
-        RaftMessage::Candidacy(i) => {
+        RaftMessage::RequestVote(data) => {
             json!({
                 "candidacy": json!({
-                    "candidate": i.candidate,
-                    "term": i.term
+                    "candidate": data.candidate,
+                    "term": data.term
                 })
             }).to_string()
         },
@@ -309,10 +309,10 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
 
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
-            RaftMessage::Candidacy(candidate) => {
-                println!("F {}: Accept candidacy of {} with term: {}", context.term, candidate.candidate, candidate.term);
-                context.term = candidate.term;
-                send_accept_candidate(&follower.host_port, &candidate.candidate, outbound_channel);
+            RaftMessage::RequestVote(data) => {
+                println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
+                context.term = data.term;
+                send_accept_candidate(&follower.host_port, &data.candidate, outbound_channel);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
                     election_timeout: Instant::now(),
@@ -364,7 +364,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
             RaftMessage::HeartBeat(_) => {
                 panic!("Not implemented");
             },
-            RaftMessage::Candidacy(_) => {
+            RaftMessage::RequestVote(_) => {
                 panic!("Not implemented");
             }
         }
@@ -382,7 +382,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 
     if candidate.last_send_time.is_none() || candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
         println!("C {}: Broadcast candidacy", context.term);
-        broadcast_candidacy(&candidate, &context.term, outbound_channel);
+        broadcast_request_vote(&candidate, &context.term, outbound_channel);
         candidate.peers_approving = Vec::new();
         candidate.peers_undecided = config.peers.clone();
         candidate.election_timeout = Instant::now();
@@ -393,7 +393,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 
     if candidate.last_send_time.unwrap().elapsed().as_millis() > candidate.resend_timeout_length {
         println!("C {}: Rebroadcast candidacy", context.term);
-        rebroadcast_candidacy(&candidate, &context.term, outbound_channel);
+        rebroadcast_request_vote(&candidate, &context.term, outbound_channel);
         candidate.last_send_time = Some(Instant::now());
     }
 
@@ -412,15 +412,15 @@ fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMess
     Role::Leader(leader)
 }
 
-fn broadcast_candidacy(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn broadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in candidate.peers_undecided.iter() {
-        send_candidacy(&candidate.host_port, term, peer, outbound_channel);
+        send_request_vote(&candidate.host_port, term, peer, outbound_channel);
     }
 }
 
-fn rebroadcast_candidacy(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn rebroadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in candidate.peers_undecided.iter() {
-        send_candidacy(&candidate.host_port, term, peer, outbound_channel);
+        send_request_vote(&candidate.host_port, term, peer, outbound_channel);
     }
 }
 
@@ -430,8 +430,8 @@ fn broadcast_heartbeat(leader: &LeaderData, term: &u64, outbound_channel: &mpsc:
     }
 }
 
-fn send_candidacy(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::Candidacy(CandidacyData{ candidate: *node, term: *term }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ candidate: *node, term: *term }), address: format!("127.0.0.1:{}", peer) }).unwrap();
 }
 
 fn send_accept_candidate(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
