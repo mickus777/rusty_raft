@@ -18,14 +18,16 @@ use serde::Serialize;
 #[derive(Serialize, Deserialize)]
 struct Config {
     peers: Vec<i32>,
-    follower_timeout: u64,
     candidate_timeout: u64,
     candidate_resend_timeout: u64,
-    heartbeat_timeout: u64
+    heartbeat_timeout: u64,
+
+    election_timeout_length: u64,
+    idle_timeout_length: u64
 }
 
 impl ::std::default::Default for Config {
-    fn default() -> Self { Self { peers: vec![], follower_timeout: 10000, candidate_timeout: 10000, candidate_resend_timeout: 2000, heartbeat_timeout: 2000 }}
+    fn default() -> Self { Self { peers: vec![], candidate_timeout: 10000, candidate_resend_timeout: 2000, heartbeat_timeout: 2000, election_timeout_length: 10000, idle_timeout_length: 1000 }}
 }
 
 enum SystemMessage {
@@ -276,14 +278,14 @@ fn serialize(message : &RaftMessage) -> String {
 
 struct FollowerData {
     host_port: i32,
-    last_timeout_reset: Instant,
-    timeout_length: u128
+    election_timeout: Instant,
+    election_timeout_length: u128,
 }
 
 struct CandidateData {
     host_port: i32,
-    last_timeout_reset: Instant,
-    timeout_length: u128,
+    election_timeout: Instant,
+    election_timeout_length: u128,
     last_send_time: Option<Instant>,
     resend_timeout_length: u128,
     peers_approving: Vec<i32>,
@@ -293,8 +295,8 @@ struct CandidateData {
 struct LeaderData {
     host_port: i32,
     peers: Vec<i32>,
-    last_heartbeat_sent: Option<Instant>,
-    timeout_length: u128
+    idle_timeout: Option<Instant>,
+    idle_timeout_length: u128
 }
 
 enum Role {
@@ -313,16 +315,16 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
                 send_accept_candidate(&follower.host_port, &candidate.candidate, outbound_channel);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
-                    last_timeout_reset: Instant::now(),
-                    timeout_length: randomize_timeout(&config.follower_timeout, &mut context.random)
+                    election_timeout: Instant::now(),
+                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
             },
             RaftMessage::HeartBeat(term) => {
                 println!("F {}: Received heartbeat, term: {}", context.term, term);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
-                    last_timeout_reset: Instant::now(),
-                    timeout_length: randomize_timeout(&config.follower_timeout, &mut context.random)
+                    election_timeout: Instant::now(),
+                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
             },
             _ => {
@@ -331,20 +333,20 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
         }
     }
 
-    if follower.last_timeout_reset.elapsed().as_millis() > follower.timeout_length {
+    if follower.election_timeout.elapsed().as_millis() > follower.election_timeout_length {
         println!("F {}: Timeout!", context.term);
         context.term += 1;
         Role::Candidate(CandidateData{ 
             host_port: follower.host_port,
-            last_timeout_reset: Instant::now(), 
-            timeout_length: u128::from(config.candidate_timeout), 
+            election_timeout: Instant::now(), 
+            election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
             last_send_time: None, 
             resend_timeout_length: u128::from(config.candidate_resend_timeout),
             peers_approving: Vec::new(),
             peers_undecided: config.peers.clone()
         })
     } else {
-        println!("F {}: Timeout in {}", context.term, follower.timeout_length - follower.last_timeout_reset.elapsed().as_millis());
+        println!("F {}: Timeout in {}", context.term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
         Role::Follower(follower)
     }
 }
@@ -373,17 +375,18 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
         return Role::Leader(LeaderData{
             host_port: candidate.host_port,
             peers: config.peers.clone(),
-            last_heartbeat_sent: None,
-            timeout_length: u128::from(config.heartbeat_timeout)
+            idle_timeout: None,
+            idle_timeout_length: u128::from(config.idle_timeout_length)
         })
     }
 
-    if candidate.last_send_time.is_none() || candidate.last_timeout_reset.elapsed().as_millis() > candidate.timeout_length {
+    if candidate.last_send_time.is_none() || candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
         println!("C {}: Broadcast candidacy", context.term);
         broadcast_candidacy(&candidate, &context.term, outbound_channel);
         candidate.peers_approving = Vec::new();
         candidate.peers_undecided = config.peers.clone();
-        candidate.last_timeout_reset = Instant::now();
+        candidate.election_timeout = Instant::now();
+        candidate.election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
         candidate.last_send_time = Some(Instant::now());
         return Role::Candidate(candidate)
     }
@@ -399,10 +402,10 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 
 fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
 
-    if leader.last_heartbeat_sent.is_none() || leader.last_heartbeat_sent.unwrap().elapsed().as_millis() > leader.timeout_length {
+    if leader.idle_timeout.is_none() || leader.idle_timeout.unwrap().elapsed().as_millis() > leader.idle_timeout_length {
         println!("L {}: Broadcast heartbeat", context.term);
         broadcast_heartbeat(&leader, &context.term, outbound_channel);
-        leader.last_heartbeat_sent = Some(Instant::now());
+        leader.idle_timeout = Some(Instant::now());
         return Role::Leader(leader)
     }
 
@@ -464,9 +467,9 @@ fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mps
         term: 0
     };
 
-    let timeout_length = randomize_timeout(&config.follower_timeout, &mut context.random);
+    let election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
 
-    let mut role = Role::Follower(FollowerData{ host_port: *host_port, last_timeout_reset: Instant::now(), timeout_length });
+    let mut role = Role::Follower(FollowerData{ host_port: *host_port, election_timeout: Instant::now(), election_timeout_length });
 
     loop {
         if let Ok(_) = system_channel.try_recv() {
