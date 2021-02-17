@@ -36,7 +36,7 @@ enum SystemMessage {
 
 enum RaftMessage {
     RequestVote(RequestVoteData),
-    RequestVoteResponse(i32),
+    RequestVoteResponse(RequestVoteResponseData),
     HeartBeat(u64),
     RejectCandidate(i32)
 }
@@ -44,6 +44,10 @@ enum RaftMessage {
 struct RequestVoteData {
     candidate: i32,
     term: u64
+}
+
+struct RequestVoteResponseData {
+    acceptor: i32
 }
 
 impl Clone for RaftMessage {
@@ -211,7 +215,7 @@ fn parse(message : &str) -> RaftMessage {
                     term: parse_u64(candidate.get("term").unwrap())
                 })
             } else if let Some(accept) = map.get("accept_candidate") {
-                RaftMessage::RequestVoteResponse(parse_i32(accept.get("acceptor").unwrap()))
+                RaftMessage::RequestVoteResponse(RequestVoteResponseData { acceptor: parse_i32(accept.get("acceptor").unwrap()) })
             } else if let Some(heartbeat) = map.get("heartbeat") {
                 RaftMessage::HeartBeat(parse_u64(heartbeat.get("term").unwrap()))
             } else {
@@ -266,7 +270,7 @@ fn serialize(message : &RaftMessage) -> String {
         RaftMessage::RequestVoteResponse(data) => {
             json!({
                 "accept_candidate": json!({
-                    "acceptor": *data
+                    "acceptor": data.acceptor
                 })
             }).to_string()
         },
@@ -357,9 +361,9 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
             RaftMessage::RequestVote(_) => {
                 panic!("Not implemented");
             },
-            RaftMessage::RequestVoteResponse(acceptor) => {
-                candidate.peers_undecided.retain(|peer| *peer != acceptor);
-                candidate.peers_approving.push(acceptor);
+            RaftMessage::RequestVoteResponse(data) => {
+                candidate.peers_undecided.retain(|peer| *peer != data.acceptor);
+                candidate.peers_approving.push(data.acceptor);
             },
             RaftMessage::RejectCandidate(rejector) => {
                 candidate.peers_undecided.retain(|peer| *peer != rejector);
@@ -435,7 +439,7 @@ fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc
 }
 
 fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(*node), address: format!("127.0.0.1:{}", candidate) }).unwrap();
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { acceptor: *node }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
 }
 
 fn send_heartbeat(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
