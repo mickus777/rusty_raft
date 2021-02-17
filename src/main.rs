@@ -36,8 +36,8 @@ enum SystemMessage {
 
 enum RaftMessage {
     RequestVote(RequestVoteData),
+    RequestVoteResponse(i32),
     HeartBeat(u64),
-    AcceptCandidate(i32),
     RejectCandidate(i32)
 }
 
@@ -211,7 +211,7 @@ fn parse(message : &str) -> RaftMessage {
                     term: parse_u64(candidate.get("term").unwrap())
                 })
             } else if let Some(accept) = map.get("accept_candidate") {
-                RaftMessage::AcceptCandidate(parse_i32(accept.get("acceptor").unwrap()))
+                RaftMessage::RequestVoteResponse(parse_i32(accept.get("acceptor").unwrap()))
             } else if let Some(heartbeat) = map.get("heartbeat") {
                 RaftMessage::HeartBeat(parse_u64(heartbeat.get("term").unwrap()))
             } else {
@@ -263,10 +263,10 @@ fn serialize(message : &RaftMessage) -> String {
                 })
             }).to_string()
         },
-        RaftMessage::AcceptCandidate(i) => {
+        RaftMessage::RequestVoteResponse(data) => {
             json!({
                 "accept_candidate": json!({
-                    "acceptor": *i
+                    "acceptor": *data
                 })
             }).to_string()
         },
@@ -312,7 +312,7 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
             RaftMessage::RequestVote(data) => {
                 println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
                 context.term = data.term;
-                send_accept_candidate(&follower.host_port, &data.candidate, outbound_channel);
+                send_request_vote_response(&follower.host_port, &data.candidate, outbound_channel);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
                     election_timeout: Instant::now(),
@@ -354,7 +354,10 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
 fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
     if let Ok(message) = inbound_channel.try_recv() {
         match message.raft_message {
-            RaftMessage::AcceptCandidate(acceptor) => {
+            RaftMessage::RequestVote(_) => {
+                panic!("Not implemented");
+            },
+            RaftMessage::RequestVoteResponse(acceptor) => {
                 candidate.peers_undecided.retain(|peer| *peer != acceptor);
                 candidate.peers_approving.push(acceptor);
             },
@@ -362,9 +365,6 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
                 candidate.peers_undecided.retain(|peer| *peer != rejector);
             },
             RaftMessage::HeartBeat(_) => {
-                panic!("Not implemented");
-            },
-            RaftMessage::RequestVote(_) => {
                 panic!("Not implemented");
             }
         }
@@ -434,8 +434,8 @@ fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc
     outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ candidate: *node, term: *term }), address: format!("127.0.0.1:{}", peer) }).unwrap();
 }
 
-fn send_accept_candidate(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::AcceptCandidate(*node), address: format!("127.0.0.1:{}", candidate) }).unwrap();
+fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(*node), address: format!("127.0.0.1:{}", candidate) }).unwrap();
 }
 
 fn send_heartbeat(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
