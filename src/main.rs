@@ -37,8 +37,7 @@ enum SystemMessage {
 enum RaftMessage {
     RequestVote(RequestVoteData),
     RequestVoteResponse(RequestVoteResponseData),
-    HeartBeat(u64),
-    RejectCandidate(i32)
+    HeartBeat(u64)
 }
 
 struct RequestVoteData {
@@ -368,10 +367,9 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
             },
             RaftMessage::RequestVoteResponse(data) => {
                 candidate.peers_undecided.retain(|peer| *peer != data.acceptor);
-                candidate.peers_approving.push(data.acceptor);
-            },
-            RaftMessage::RejectCandidate(rejector) => {
-                candidate.peers_undecided.retain(|peer| *peer != rejector);
+                if data.success {
+                    candidate.peers_approving.push(data.acceptor);
+                }
             },
             RaftMessage::HeartBeat(_) => {
                 panic!("Not implemented");
