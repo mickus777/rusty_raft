@@ -20,14 +20,13 @@ struct Config {
     peers: Vec<i32>,
     candidate_timeout: u64,
     candidate_resend_timeout: u64,
-    heartbeat_timeout: u64,
 
     election_timeout_length: u64,
     idle_timeout_length: u64
 }
 
 impl ::std::default::Default for Config {
-    fn default() -> Self { Self { peers: vec![], candidate_timeout: 10000, candidate_resend_timeout: 2000, heartbeat_timeout: 2000, election_timeout_length: 10000, idle_timeout_length: 1000 }}
+    fn default() -> Self { Self { peers: vec![], candidate_timeout: 10000, candidate_resend_timeout: 2000, election_timeout_length: 10000, idle_timeout_length: 1000 }}
 }
 
 enum SystemMessage {
@@ -37,7 +36,12 @@ enum SystemMessage {
 enum RaftMessage {
     RequestVote(RequestVoteData),
     RequestVoteResponse(RequestVoteResponseData),
-    HeartBeat(u64)
+    AppendEntries(AppendEntriesData),
+}
+
+#[derive(Clone)]
+struct AppendEntriesData {
+    term: u64    
 }
 
 struct RequestVoteData {
@@ -53,8 +57,8 @@ struct RequestVoteResponseData {
 impl Clone for RaftMessage {
     fn clone(&self) -> Self {
         match self {
-            RaftMessage::HeartBeat(i) => {
-                RaftMessage::HeartBeat(i.clone())
+            RaftMessage::AppendEntries(data) => {
+                RaftMessage::AppendEntries(data.clone())
             },
             _ => {
                 panic!("Not implemented");
@@ -66,8 +70,8 @@ impl Clone for RaftMessage {
 impl fmt::Display for RaftMessage {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            RaftMessage::HeartBeat(i) => {
-                write!(f, "HeartBeat {:?}", i)
+            RaftMessage::AppendEntries(data) => {
+                write!(f, "AppendEntries {:?}", data.term)
             },
             _ => {
                 panic!("Not implemented");
@@ -209,18 +213,20 @@ fn parse(message : &str) -> RaftMessage {
     let msg = serde_json::from_str(message).unwrap();
     match msg {
         Value::Object(map) => {
-            if let Some(candidate) = map.get("candidacy") {
+            if let Some(candidate) = map.get("request_vote") {
                 RaftMessage::RequestVote(RequestVoteData {
                     candidate: parse_i32(candidate.get("candidate").unwrap()), 
                     term: parse_u64(candidate.get("term").unwrap())
                 })
-            } else if let Some(accept) = map.get("request_vote_response") {
+            } else if let Some(request_vote_response) = map.get("request_vote_response") {
                 RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
-                    success: accept.get("success").unwrap() == "true",
-                    acceptor: parse_i32(accept.get("acceptor").unwrap()) 
+                    success: request_vote_response.get("success").unwrap() == "true",
+                    acceptor: parse_i32(request_vote_response.get("acceptor").unwrap()) 
                 })
-            } else if let Some(heartbeat) = map.get("heartbeat") {
-                RaftMessage::HeartBeat(parse_u64(heartbeat.get("term").unwrap()))
+            } else if let Some(append_entries) = map.get("append_entries") {
+                RaftMessage::AppendEntries(AppendEntriesData {
+                    term: parse_u64(append_entries.get("term").unwrap())
+                })
             } else {
                 panic!("Not handled {}", message);
             }
@@ -255,16 +261,16 @@ fn parse_u64(value: &serde_json::Value) -> u64 {
 
 fn serialize(message : &RaftMessage) -> String {
     match message {
-        RaftMessage::HeartBeat(i) => {
+        RaftMessage::AppendEntries(data) => {
             json!({
-                "heartbeat": json!({
-                    "term": *i
+                "append_entries": json!({
+                    "term": data.term
                 })
             }).to_string()
         },
         RaftMessage::RequestVote(data) => {
             json!({
-                "candidacy": json!({
+                "request_vote": json!({
                     "candidate": data.candidate,
                     "term": data.term
                 })
@@ -317,18 +323,18 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
 
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
-            RaftMessage::RequestVote(data) => {
-                println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
-                context.term = data.term;
-                send_request_vote_response(&follower.host_port, &data.candidate, outbound_channel);
+            RaftMessage::AppendEntries(data) => {
+                println!("F {}: Received append entries, term: {}", context.term, data.term);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
                     election_timeout: Instant::now(),
                     election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
             },
-            RaftMessage::HeartBeat(term) => {
-                println!("F {}: Received heartbeat, term: {}", context.term, term);
+            RaftMessage::RequestVote(data) => {
+                println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
+                context.term = data.term;
+                send_request_vote_response(&follower.host_port, &data.candidate, outbound_channel);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
                     election_timeout: Instant::now(),
@@ -371,7 +377,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
                     candidate.peers_approving.push(data.acceptor);
                 }
             },
-            RaftMessage::HeartBeat(_) => {
+            RaftMessage::AppendEntries(_) => {
                 panic!("Not implemented");
             }
         }
@@ -410,8 +416,8 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
 
     if leader.idle_timeout.is_none() || leader.idle_timeout.unwrap().elapsed().as_millis() > leader.idle_timeout_length {
-        println!("L {}: Broadcast heartbeat", context.term);
-        broadcast_heartbeat(&leader, &context.term, outbound_channel);
+        println!("L {}: Broadcast AppendEntries Idle", context.term);
+        broadcast_append_entries_idle(&leader, &context.term, outbound_channel);
         leader.idle_timeout = Some(Instant::now());
         return Role::Leader(leader)
     }
@@ -431,22 +437,30 @@ fn rebroadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_chan
     }
 }
 
-fn broadcast_heartbeat(leader: &LeaderData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn broadcast_append_entries_idle(leader: &LeaderData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in leader.peers.iter() {
-        send_heartbeat(term, peer, outbound_channel);
+        send_append_entries_idle(term, peer, outbound_channel);
     }
 }
 
 fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ candidate: *node, term: *term }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ 
+        candidate: *node, 
+        term: *term
+    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
 }
 
 fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { success: true, acceptor: *node }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
+        success: true, 
+        acceptor: *node 
+    }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
 }
 
-fn send_heartbeat(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::HeartBeat(*term), address: format!("127.0.0.1:{}", peer) }).unwrap();
+fn send_append_entries_idle(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::AppendEntries(AppendEntriesData{
+        term: *term
+    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
 }
 
 fn tick(role: Role, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
