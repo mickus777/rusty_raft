@@ -34,14 +34,21 @@ enum SystemMessage {
 }
 
 enum RaftMessage {
-    RequestVote(RequestVoteData),
-    RequestVoteResponse(RequestVoteResponseData),
     AppendEntries(AppendEntriesData),
+    AppendEntriesResponse(AppendEntriesResponseData),
+    RequestVote(RequestVoteData),
+    RequestVoteResponse(RequestVoteResponseData)
 }
 
 #[derive(Clone)]
 struct AppendEntriesData {
-    term: u64    
+    term: u64,
+    leader: i32    
+}
+
+struct AppendEntriesResponseData {
+    term: u64,
+    responder: i32
 }
 
 struct RequestVoteData {
@@ -225,7 +232,13 @@ fn parse(message : &str) -> RaftMessage {
                 })
             } else if let Some(append_entries) = map.get("append_entries") {
                 RaftMessage::AppendEntries(AppendEntriesData {
-                    term: parse_u64(append_entries.get("term").unwrap())
+                    term: parse_u64(append_entries.get("term").unwrap()),
+                    leader: parse_i32(append_entries.get("leader").unwrap())
+                })
+            } else if let Some(append_entries_response) = map.get("append_entries_response") {
+                RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
+                    term: parse_u64(append_entries_response.get("term").unwrap()),
+                    responder: parse_i32(append_entries_response.get("responder").unwrap())
                 })
             } else {
                 panic!("Not handled {}", message);
@@ -264,7 +277,16 @@ fn serialize(message : &RaftMessage) -> String {
         RaftMessage::AppendEntries(data) => {
             json!({
                 "append_entries": json!({
-                    "term": data.term
+                    "term": data.term,
+                    "leader": data.leader
+                })
+            }).to_string()
+        },
+        RaftMessage::AppendEntriesResponse(data) => {
+            json!({
+                "append_entries_response": json!({
+                    "term": data.term,
+                    "responder": data.responder
                 })
             }).to_string()
         },
@@ -283,9 +305,6 @@ fn serialize(message : &RaftMessage) -> String {
                     "acceptor": data.acceptor
                 })
             }).to_string()
-        },
-        _ => {
-            panic!("Not implemented!");
         }
     }
 }
@@ -325,11 +344,16 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
         match msg.raft_message {
             RaftMessage::AppendEntries(data) => {
                 println!("F {}: Received append entries, term: {}", context.term, data.term);
+                context.term = data.term;
+                send_append_entries_response(&context.term, &follower.host_port, &data.leader, outbound_channel);
                 return Role::Follower(FollowerData{
                     host_port: follower.host_port,
                     election_timeout: Instant::now(),
                     election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
+            },
+            RaftMessage::AppendEntriesResponse(_) => {
+                // Old or misguided message, ignore
             },
             RaftMessage::RequestVote(data) => {
                 println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
@@ -341,8 +365,8 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
                     election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
             },
-            _ => {
-                panic!("Unknown message");
+            RaftMessage::RequestVoteResponse(_) => {
+                // Old or misguided message, ignore
             }
         }
     }
@@ -378,6 +402,9 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
                 }
             },
             RaftMessage::AppendEntries(_) => {
+                panic!("Not implemented");
+            },
+            RaftMessage::AppendEntriesResponse(_) => {
                 panic!("Not implemented");
             }
         }
@@ -415,6 +442,23 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 
 fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
 
+    if let Ok(msg) = inbound_channel.try_recv() {
+        match msg.raft_message {
+            RaftMessage::AppendEntries(_) => {
+                panic!("Not implemented");
+            },
+            RaftMessage::AppendEntriesResponse(data) => {
+                println!("T: {}, append entries response: {} from {}", context.term, data.term, data.responder)
+            },
+            RaftMessage::RequestVote(_) => {
+                panic!("Not implemented");
+            },
+            RaftMessage::RequestVoteResponse(_) => {
+                // Ignore for now
+            }
+        }
+    }
+
     if leader.idle_timeout.is_none() || leader.idle_timeout.unwrap().elapsed().as_millis() > leader.idle_timeout_length {
         println!("L {}: Broadcast AppendEntries Idle", context.term);
         broadcast_append_entries_idle(&leader, &context.term, outbound_channel);
@@ -439,11 +483,12 @@ fn rebroadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_chan
 
 fn broadcast_append_entries_idle(leader: &LeaderData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in leader.peers.iter() {
-        send_append_entries_idle(term, peer, outbound_channel);
+        send_append_entries_idle(term, &leader.host_port, peer, outbound_channel);
     }
 }
 
 fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+    println!("T {}: Send request vote to: {}", term, peer);
     outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ 
         candidate: *node, 
         term: *term
@@ -457,9 +502,18 @@ fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mp
     }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
 }
 
-fn send_append_entries_idle(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_append_entries_idle(term: &u64, leader: &i32, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
     outbound_channel.send(DataMessage { raft_message: RaftMessage::AppendEntries(AppendEntriesData{
-        term: *term
+        term: *term,
+        leader: *leader
+    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+}
+
+fn send_append_entries_response(term: &u64, responder: &i32, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+    println!("Sending {} to {}", term, peer);
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
+        term: *term,
+        responder: *responder
     }), address: format!("127.0.0.1:{}", peer) }).unwrap();
 }
 
