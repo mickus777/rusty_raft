@@ -47,6 +47,7 @@ struct RequestVoteData {
 }
 
 struct RequestVoteResponseData {
+    success: bool,
     acceptor: i32
 }
 
@@ -214,8 +215,11 @@ fn parse(message : &str) -> RaftMessage {
                     candidate: parse_i32(candidate.get("candidate").unwrap()), 
                     term: parse_u64(candidate.get("term").unwrap())
                 })
-            } else if let Some(accept) = map.get("accept_candidate") {
-                RaftMessage::RequestVoteResponse(RequestVoteResponseData { acceptor: parse_i32(accept.get("acceptor").unwrap()) })
+            } else if let Some(accept) = map.get("request_vote_response") {
+                RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
+                    success: accept.get("success").unwrap() == "true",
+                    acceptor: parse_i32(accept.get("acceptor").unwrap()) 
+                })
             } else if let Some(heartbeat) = map.get("heartbeat") {
                 RaftMessage::HeartBeat(parse_u64(heartbeat.get("term").unwrap()))
             } else {
@@ -269,7 +273,8 @@ fn serialize(message : &RaftMessage) -> String {
         },
         RaftMessage::RequestVoteResponse(data) => {
             json!({
-                "accept_candidate": json!({
+                "request_vote_response": json!({
+                    "success": if data.success { "true" } else { "false" },
                     "acceptor": data.acceptor
                 })
             }).to_string()
@@ -439,7 +444,7 @@ fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc
 }
 
 fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { acceptor: *node }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
+    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { success: true, acceptor: *node }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
 }
 
 fn send_heartbeat(term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
