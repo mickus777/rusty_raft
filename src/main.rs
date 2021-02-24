@@ -411,7 +411,7 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
             },
             RaftMessage::AppendEntries(data) => {
                 println!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, message.peer, data.term);
-                if data.term > context.persistent_state.current_term {
+                if data.term >= context.persistent_state.current_term {
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
                     send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
