@@ -202,7 +202,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
     }
 
     let mut random = rand::thread_rng();
-    let bad_connection_chance = 0.05;
+    let bad_connection_chance = 0.025;
     let mut transfers_to_miss = 0;
 
     loop {
@@ -373,19 +373,7 @@ fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &
                 // Old or misguided message, ignore
             },
             RaftMessage::RequestVote(data) => {
-                if data.term <= context.persistent_state.current_term {
-                    println!("F {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, msg.peer, data.term);
-                    send_request_vote_response(&context.persistent_state.current_term, false, &msg.peer, outbound_channel);
-                    return Role::Follower(follower)
-                } else {
-                    println!("F {}: Accept candidacy of {} with term: {}", context.persistent_state.current_term, msg.peer, data.term);
-                    context.persistent_state.current_term = data.term;
-                    send_request_vote_response(&context.persistent_state.current_term, true, &msg.peer, outbound_channel);
-                    return Role::Follower(FollowerData{
-                        election_timeout: Instant::now(),
-                        election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                    })
-                }
+                return handle_request_vote(&data, &msg.peer, Role::Follower(follower), outbound_channel, config, context)
             },
             RaftMessage::RequestVoteResponse(_) => {
                 // Old or misguided message, ignore
@@ -414,19 +402,7 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
     if let Ok(message) = inbound_channel.try_recv() {
         match &message.raft_message {
             RaftMessage::RequestVote(data) => {
-                if data.term <= context.persistent_state.current_term {
-                    println!("F {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, message.peer, data.term);
-                    send_request_vote_response(&context.persistent_state.current_term, false, &message.peer, outbound_channel);
-                    return Role::Candidate(candidate)
-                } else {
-                    println!("F {}: Accept candidacy of {} with term: {}", context.persistent_state.current_term, message.peer, data.term);
-                    context.persistent_state.current_term = data.term;
-                    send_request_vote_response(&context.persistent_state.current_term, true, &message.peer, outbound_channel);
-                    return Role::Follower(FollowerData {
-                        election_timeout: Instant::now(),
-                        election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                    })
-                }
+                return handle_request_vote(&data, &message.peer, Role::Candidate(candidate), outbound_channel, config, context)
             },
             RaftMessage::RequestVoteResponse(data) => {
                 candidate.peers_undecided.retain(|peer| *peer != message.peer);
@@ -484,28 +460,14 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
             RaftMessage::AppendEntries(data) => {
                 println!("L {}: append entries from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
                 context.persistent_state.current_term = data.term;
-                return Role::Follower(FollowerData{
-                    election_timeout: Instant::now(),
-                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                })
+                return become_follower(config, context)
             },
             RaftMessage::AppendEntriesResponse(data) => {
                 println!("L {}: append entries response: {} from {}", context.persistent_state.current_term, data.term, message.peer)
             },
             RaftMessage::RequestVote(data) => {
-                if data.term <= context.persistent_state.current_term {
-                    println!("L {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, message.peer, data.term);
-                    send_request_vote_response(&context.persistent_state.current_term, false, &message.peer, outbound_channel);
-                    return Role::Leader(leader)
-                } else {
-                    println!("L {}: Accept candidacy of {} with term: {}", context.persistent_state.current_term, message.peer, data.term);
-                    context.persistent_state.current_term = data.term;
-                    send_request_vote_response(&context.persistent_state.current_term, true, &message.peer, outbound_channel);
-                    return Role::Follower(FollowerData{
-                        election_timeout: Instant::now(),
-                        election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                    })
-                }
+                println!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
+                return handle_request_vote(&data, &message.peer, Role::Leader(leader), outbound_channel, config, context)
             },
             RaftMessage::RequestVoteResponse(_) => {
                 // Ignore for now
@@ -521,6 +483,26 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
     }
 
     Role::Leader(leader)
+}
+
+fn handle_request_vote(data: &RequestVoteData, peer: &String, old_role: Role, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
+    if data.term <= context.persistent_state.current_term {
+        println!("F {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, peer, data.term);
+        send_request_vote_response(&context.persistent_state.current_term, false, &peer, outbound_channel);
+        old_role
+    } else {
+        println!("F {}: Accept candidacy of {} with term: {}", context.persistent_state.current_term, peer, data.term);
+        context.persistent_state.current_term = data.term;
+        send_request_vote_response(&context.persistent_state.current_term, true, &peer, outbound_channel);
+        become_follower(config, context)
+    }
+}
+
+fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
+    return Role::Follower(FollowerData{
+        election_timeout: Instant::now(),
+        election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
+    })
 }
 
 fn broadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
