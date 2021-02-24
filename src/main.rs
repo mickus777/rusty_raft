@@ -17,7 +17,6 @@ use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
-    candidate_timeout: u64,
     candidate_resend_timeout: u64,
 
     election_timeout_length: u64,
@@ -26,10 +25,16 @@ struct Config {
     peers: HashMap<String, String>
 }
 
+struct TimeoutConfig {
+    candidate_resend_timeout: u64,
+
+    election_timeout_length: u64,
+    idle_timeout_length: u64
+}
+
 impl ::std::default::Default for Config {
     fn default() -> Self { 
         Self { 
-            candidate_timeout: 10000, 
             candidate_resend_timeout: 2000, 
             election_timeout_length: 10000, 
             idle_timeout_length: 1000,
@@ -123,13 +128,23 @@ fn main() {
         }
     };
 
-    let mut config : Config = confy::load("rusty_raft").unwrap();
-    if config.peers.len() < 3 {
+    let config : Config = confy::load("rusty_raft").unwrap();
+
+    let timeout_config = TimeoutConfig {
+        candidate_resend_timeout: config.candidate_resend_timeout,
+        election_timeout_length: config.election_timeout_length,
+        idle_timeout_length: config.idle_timeout_length
+    };
+    let mut peers = config.peers;
+
+    if peers.len() < 3 {
         println!("Invalid list of peers. At least three are required.");
         usage();
         panic!("Aborting!");
     }
-    let local_address = config.peers.remove(&name).unwrap();
+
+    let local_address = peers.remove(&name).unwrap();
+    let peer_names : Vec<String> = peers.iter().map(|(peer_name, _)| peer_name.clone()).collect();
 
     println!("Starting {}", name);
 
@@ -139,10 +154,9 @@ fn main() {
     let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
-    let udp_peers = config.peers.clone();
-    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, udp_peers); });
+    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, peers); });
     let loop_handle = thread::spawn(move || { 
-        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &config); 
+        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &timeout_config, peer_names); 
     });
 
     let mut buffer = String::new();
@@ -304,7 +318,7 @@ enum Role {
     Leader(LeaderData)
 }
 
-fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
+fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
 
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
@@ -344,7 +358,7 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
             last_send_time: None, 
             resend_timeout_length: u128::from(config.candidate_resend_timeout),
             peers_approving: Vec::new(),
-            peers_undecided: config.peers.keys().cloned().collect::<Vec<String>>()
+            peers_undecided: peers.iter().map(|peer| peer.clone()).collect::<Vec<String>>()
         })
     } else {
         println!("F {}: Timeout in {}", context.term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
@@ -352,7 +366,7 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
     }
 }
 
-fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
+fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
     if let Ok(message) = inbound_channel.try_recv() {
         match &message.raft_message {
             RaftMessage::RequestVote(_) => {
@@ -373,7 +387,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
         }
     }
 
-    if candidate.peers_approving.len() >= config.peers.len() / 2 {
+    if candidate.peers_approving.len() >= peers.len() / 2 {
         println!("C {}: Elected!", context.term);
         return Role::Leader(LeaderData{
             idle_timeout: None,
@@ -384,7 +398,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
     if candidate.last_send_time.is_none() || candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
         println!("C {}: Broadcast candidacy", context.term);
         candidate.peers_approving = Vec::new();
-        candidate.peers_undecided = config.peers.keys().cloned().collect::<Vec<String>>();
+        candidate.peers_undecided = peers.iter().map(|peer| peer.clone()).collect::<Vec<String>>();
         candidate.election_timeout = Instant::now();
         candidate.election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
         candidate.last_send_time = Some(Instant::now());
@@ -401,7 +415,7 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
     Role::Candidate(candidate)
 }
 
-fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
+fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
 
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
@@ -422,7 +436,7 @@ fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMess
 
     if leader.idle_timeout.is_none() || leader.idle_timeout.unwrap().elapsed().as_millis() > leader.idle_timeout_length {
         println!("L {}: Broadcast AppendEntries Idle", context.term);
-        broadcast_append_entries_idle(&context.term, &config.peers.keys().map(|key| key.clone()).collect::<Vec<String>>(), outbound_channel);
+        broadcast_append_entries_idle(&context.term, peers, outbound_channel);
         leader.idle_timeout = Some(Instant::now());
         return Role::Leader(leader)
     }
@@ -485,16 +499,16 @@ fn send_append_entries_response(term: &u64, leader: &String, outbound_channel: &
     }).unwrap();
 }
 
-fn tick(role: Role, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
+fn tick(role: Role, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
     match role {
         Role::Follower(data) => {
-            tick_follower(data, inbound_channel, outbound_channel, config, context)
+            tick_follower(data, peers, inbound_channel, outbound_channel, config, context)
         }
         Role::Candidate(data) => {
-            tick_candidate(data, inbound_channel, outbound_channel, config, context)
+            tick_candidate(data, peers, inbound_channel, outbound_channel, config, context)
         }
         Role::Leader(data) => {
-            tick_leader(data, inbound_channel, outbound_channel, config, context)
+            tick_leader(data, peers, inbound_channel, outbound_channel, config, context)
         }
     }
 }
@@ -503,7 +517,7 @@ fn randomize_timeout(base: &u64, random: &mut rand::rngs::ThreadRng) -> u128 {
     u128::from(base + random.gen_range(1..*base))
 }
 
-fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, config: &Config) {
+fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, config: &TimeoutConfig, peers: Vec<String>) {
 
     let mut context = Context { 
         random: rand::thread_rng(),
@@ -523,7 +537,7 @@ fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mps
             break;
         }
 
-        role = tick(role, &inbound_channel, &outbound_channel, config, &mut context);
+        role = tick(role, &peers, &inbound_channel, &outbound_channel, config, &mut context);
 
         thread::sleep(Duration::from_millis(1000));
     }
