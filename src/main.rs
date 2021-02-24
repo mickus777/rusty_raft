@@ -469,7 +469,13 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
             },
             RaftMessage::RequestVote(data) => {
                 println!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
-                handle_request_vote(&data, &message.peer, Role::Leader(leader), outbound_channel, config, context)
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                    become_follower(config, context)
+                } else {
+                    handle_request_vote(&data, &message.peer, Role::Leader(leader), outbound_channel, config, context)
+                }
             },
             RaftMessage::RequestVoteResponse(data) => {
                 println!("L {}: RequestVoteResponse from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
@@ -490,25 +496,31 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
 }
 
 fn handle_request_vote(data: &RequestVoteData, candidate: &String, old_role: Role, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
-    if data.term <= context.persistent_state.current_term {
-        println!("F {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, candidate, data.term);
+    if data.term < context.persistent_state.current_term {
+        println!("X {}: Reject candidacy of {} with term: {}", context.persistent_state.current_term, candidate, data.term);
         send_request_vote_response(&context.persistent_state.current_term, false, &candidate, outbound_channel);
         return old_role
     } 
     
-    if let Some(voted_for) = &context.persistent_state.voted_for {
-        if voted_for != candidate {
-            println!("F {}: Reject candidacy of {} has already voted for {}", context.persistent_state.current_term, candidate, voted_for);
-            send_request_vote_response(&context.persistent_state.current_term, false, &candidate, outbound_channel);
-            return old_role
-        }
+    if let None = &context.persistent_state.voted_for {
+        println!("X {}: Accept new candidacy of {} with term: {}", context.persistent_state.current_term, candidate, data.term);
+        context.persistent_state.current_term = data.term;
+        context.persistent_state.voted_for = Some(candidate.clone());
+        send_request_vote_response(&context.persistent_state.current_term, true, &candidate, outbound_channel);
+        return become_follower(config, context)
+    } else if let Some(voted_for) = &context.persistent_state.voted_for {
+        if voted_for == candidate {
+            println!("X {}: Accept old candidacy of {} with term: {}", context.persistent_state.current_term, candidate, data.term);
+            context.persistent_state.current_term = data.term;
+            context.persistent_state.voted_for = Some(candidate.clone());
+            send_request_vote_response(&context.persistent_state.current_term, true, &candidate, outbound_channel);
+            return become_follower(config, context)
+        }        
     }
 
-    println!("F {}: Accept candidacy of {} with term: {}", context.persistent_state.current_term, candidate, data.term);
-    context.persistent_state.current_term = data.term;
-    context.persistent_state.voted_for = Some(candidate.clone());
-    send_request_vote_response(&context.persistent_state.current_term, true, &candidate, outbound_channel);
-    become_follower(config, context)
+    println!("X {}: Reject candidacy of {} has already voted.", context.persistent_state.current_term, candidate);
+    send_request_vote_response(&context.persistent_state.current_term, false, &candidate, outbound_channel);
+    old_role
 }
 
 fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
