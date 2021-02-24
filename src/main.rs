@@ -17,8 +17,6 @@ use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
-    candidate_resend_timeout: u64,
-
     election_timeout_length: u64,
     idle_timeout_length: u64,
 
@@ -26,8 +24,6 @@ struct Config {
 }
 
 struct TimeoutConfig {
-    candidate_resend_timeout: u64,
-
     election_timeout_length: u64,
     idle_timeout_length: u64
 }
@@ -35,7 +31,6 @@ struct TimeoutConfig {
 impl ::std::default::Default for Config {
     fn default() -> Self { 
         Self { 
-            candidate_resend_timeout: 2000, 
             election_timeout_length: 10000, 
             idle_timeout_length: 1000,
             peers: HashMap::new()
@@ -144,7 +139,6 @@ fn main() {
     let config : Config = confy::load("rusty_raft").unwrap();
 
     let timeout_config = TimeoutConfig {
-        candidate_resend_timeout: config.candidate_resend_timeout,
         election_timeout_length: config.election_timeout_length,
         idle_timeout_length: config.idle_timeout_length
     };
@@ -340,8 +334,6 @@ struct FollowerData {
 struct CandidateData {
     election_timeout: Instant,
     election_timeout_length: u128,
-    last_send_time: Option<Instant>,
-    resend_timeout_length: u128,
     peers_approving: Vec<String>,
     peers_undecided: Vec<String>
 }
@@ -391,11 +383,10 @@ fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &
         println!("F {}: Timeout!", context.persistent_state.current_term);
         context.persistent_state.current_term += 1;
         context.persistent_state.voted_for = Some(context.name.clone());
+        broadcast_request_vote(&context.persistent_state.current_term, &peers, outbound_channel);
         Role::Candidate(CandidateData{ 
             election_timeout: Instant::now(), 
             election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
-            last_send_time: None, 
-            resend_timeout_length: u128::from(config.candidate_resend_timeout),
             peers_approving: Vec::new(),
             peers_undecided: peers.iter().map(|peer| peer.clone()).collect::<Vec<String>>()
         })
@@ -454,24 +445,21 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
         })
     }
 
-    if candidate.last_send_time.is_none() || candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
-        println!("C {}: Broadcast candidacy", context.persistent_state.current_term);
-        candidate.peers_approving = Vec::new();
-        candidate.peers_undecided = peers.iter().map(|peer| peer.clone()).collect::<Vec<String>>();
-        candidate.election_timeout = Instant::now();
-        candidate.election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
-        candidate.last_send_time = Some(Instant::now());
-        broadcast_request_vote(&context.persistent_state.current_term, &candidate.peers_undecided, outbound_channel);
-        return Role::Candidate(candidate)
+    if candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
+        println!("C {}: Timeout!", context.persistent_state.current_term);
+        context.persistent_state.current_term += 1;
+        context.persistent_state.voted_for = Some(context.name.clone());
+        broadcast_request_vote(&context.persistent_state.current_term, &peers, outbound_channel);
+        Role::Candidate(CandidateData{ 
+            election_timeout: Instant::now(), 
+            election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
+            peers_approving: Vec::new(),
+            peers_undecided: peers.iter().map(|peer| peer.clone()).collect::<Vec<String>>()
+        })
+    } else {
+        println!("C {}: Timeout in {}", context.persistent_state.current_term, candidate.election_timeout_length - candidate.election_timeout.elapsed().as_millis());
+        Role::Candidate(candidate)
     }
-
-    if candidate.last_send_time.unwrap().elapsed().as_millis() > candidate.resend_timeout_length {
-        println!("C {}: Rebroadcast candidacy", context.persistent_state.current_term);
-        rebroadcast_request_vote(&context.persistent_state.current_term, &candidate.peers_undecided, outbound_channel);
-        candidate.last_send_time = Some(Instant::now());
-    }
-
-    Role::Candidate(candidate)
 }
 
 fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
@@ -552,12 +540,6 @@ fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
 }
 
 fn broadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
-    for peer in peers.iter() {
-        send_request_vote(term, peer, outbound_channel);
-    }
-}
-
-fn rebroadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in peers.iter() {
         send_request_vote(term, peer, outbound_channel);
     }
