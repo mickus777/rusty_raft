@@ -441,16 +441,28 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
 
 fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
 
-    if let Ok(msg) = inbound_channel.try_recv() {
-        match msg.raft_message {
+    if let Ok(message) = inbound_channel.try_recv() {
+        match message.raft_message {
             RaftMessage::AppendEntries(_) => {
                 panic!("Not implemented");
             },
             RaftMessage::AppendEntriesResponse(data) => {
-                println!("L {}: append entries response: {} from {}", context.term, data.term, msg.peer)
+                println!("L {}: append entries response: {} from {}", context.term, data.term, message.peer)
             },
-            RaftMessage::RequestVote(_) => {
-                // Ignore for now
+            RaftMessage::RequestVote(data) => {
+                if data.term <= context.term {
+                    println!("L {}: Reject candidacy of {} with term: {}", context.term, message.peer, data.term);
+                    send_request_vote_response(&context.term, false, &message.peer, outbound_channel);
+                    return Role::Leader(leader)
+                } else {
+                    println!("L {}: Accept candidacy of {} with term: {}", context.term, message.peer, data.term);
+                    context.term = data.term;
+                    send_request_vote_response(&context.term, true, &message.peer, outbound_channel);
+                    return Role::Follower(FollowerData{
+                        election_timeout: Instant::now(),
+                        election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
+                    })
+                }
             },
             RaftMessage::RequestVoteResponse(_) => {
                 // Ignore for now
