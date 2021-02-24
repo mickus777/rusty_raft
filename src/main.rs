@@ -69,7 +69,7 @@ struct RequestVoteData {
 
 struct RequestVoteResponseData {
     term: u64,
-    success: bool
+    vote_granted: bool
 }
 
 impl Clone for RaftMessage {
@@ -267,7 +267,7 @@ fn parse(message : &str) -> RaftMessage {
             } else if let Some(request_vote_response) = map.get("request_vote_response") {
                 RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
                     term: parse_u64(request_vote_response.get("term").unwrap()),
-                    success: request_vote_response.get("success").unwrap() == "true"
+                    vote_granted: request_vote_response.get("vote_granted").unwrap() == "true"
                 })
             } else if let Some(append_entries) = map.get("append_entries") {
                 RaftMessage::AppendEntries(AppendEntriesData {
@@ -325,7 +325,7 @@ fn serialize(message : &RaftMessage) -> String {
             json!({
                 "request_vote_response": json!({
                     "term": data.term,
-                    "success": if data.success { "true" } else { "false" }
+                    "vote_granted": if data.vote_granted { "true" } else { "false" }
                 })
             }).to_string()
         }
@@ -409,7 +409,7 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
             },
             RaftMessage::RequestVoteResponse(data) => {
                 candidate.peers_undecided.retain(|peer| *peer != message.peer);
-                if data.success {
+                if data.vote_granted {
                     candidate.peers_approving.push(message.peer);
                 }
             },
@@ -546,11 +546,11 @@ fn send_request_vote(term: &u64, peer: &String, outbound_channel: &mpsc::Sender<
     }).unwrap();
 }
 
-fn send_request_vote_response(term: &u64, success: bool, candidate: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_request_vote_response(term: &u64, vote_granted: bool, candidate: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
     outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
             term: *term,
-            success: success
+            vote_granted: vote_granted
         }), 
         peer: (*candidate).clone()
     }).unwrap();
