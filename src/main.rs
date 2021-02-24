@@ -362,23 +362,27 @@ fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
             RaftMessage::AppendEntries(data) => {
-                println!("F {}: Received append entries, term: {}", context.persistent_state.current_term, data.term);
-                context.persistent_state.current_term = data.term;
-                context.persistent_state.voted_for = None;
+                println!("F {}: Received AppendEntries from {} term: {}", context.persistent_state.current_term, msg.peer, data.term);
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                }
                 send_append_entries_response(&context.persistent_state.current_term, &msg.peer, outbound_channel);
-                return Role::Follower(FollowerData{
-                    election_timeout: Instant::now(),
-                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                })
+                return become_follower(config, context)
             },
-            RaftMessage::AppendEntriesResponse(_) => {
+            RaftMessage::AppendEntriesResponse(data) => {
+                println!("F {}: Received AppendEntriesResponse from {} term: {}", context.persistent_state.current_term, msg.peer, data.term);
                 // Old or misguided message, ignore
+                return Role::Follower(follower)
             },
             RaftMessage::RequestVote(data) => {
+                println!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, msg.peer, data.term);
                 return handle_request_vote(&data, &msg.peer, Role::Follower(follower), outbound_channel, config, context)
             },
-            RaftMessage::RequestVoteResponse(_) => {
+            RaftMessage::RequestVoteResponse(data) => {
+                println!("F {}: Received RequestVoteResponse from {} term: {}", context.persistent_state.current_term, msg.peer, data.term);
                 // Old or misguided message, ignore
+                return Role::Follower(follower)
             }
         }
     }
@@ -405,26 +409,39 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
     if let Ok(message) = inbound_channel.try_recv() {
         match &message.raft_message {
             RaftMessage::RequestVote(data) => {
+                println!("C {}: RequestVote from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
                 return handle_request_vote(&data, &message.peer, Role::Candidate(candidate), outbound_channel, config, context)
             },
             RaftMessage::RequestVoteResponse(data) => {
-                candidate.peers_undecided.retain(|peer| *peer != message.peer);
-                if data.vote_granted {
-                    candidate.peers_approving.push(message.peer);
+                println!("C {}: RequestVoteResponse from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                    return become_follower(config, context)
+                } else {
+                    candidate.peers_undecided.retain(|peer| *peer != message.peer);
+                    if data.vote_granted {
+                        candidate.peers_approving.push(message.peer);
+                    }
+                    return Role::Candidate(candidate)
                 }
             },
             RaftMessage::AppendEntries(data) => {
-                println!("C {}: Received append entries from new leader, term: {}", context.persistent_state.current_term, data.term);
-                context.persistent_state.current_term = data.term;
-                context.persistent_state.voted_for = None;
-                send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
-                return Role::Follower(FollowerData{
-                    election_timeout: Instant::now(),
-                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
-                })
+                println!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, message.peer, data.term);
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    return become_follower(config, context)
+                } else {
+                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    return Role::Candidate(candidate)
+                }
             },
-            RaftMessage::AppendEntriesResponse(_) => {
-                panic!("Not implemented");
+            RaftMessage::AppendEntriesResponse(data) => {
+                println!("C {}: Received AppendEntriesResponse from {}, term: {}", context.persistent_state.current_term, message.peer, data.term);
+                // Old or misguided message, ignore
+                return Role::Candidate(candidate)
             }
         }
     }
@@ -462,20 +479,35 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
     if let Ok(message) = inbound_channel.try_recv() {
         match message.raft_message {
             RaftMessage::AppendEntries(data) => {
-                println!("L {}: append entries from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
-                context.persistent_state.current_term = data.term;
-                context.persistent_state.voted_for = None;
-                return become_follower(config, context)
+                println!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    return become_follower(config, context)
+                } else {
+                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    return Role::Leader(leader)
+                }
             },
             RaftMessage::AppendEntriesResponse(data) => {
-                println!("L {}: append entries response: {} from {}", context.persistent_state.current_term, data.term, message.peer)
+                println!("L {}: AppendEntriesResponse from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
+                if data.term > context.persistent_state.current_term {
+                    context.persistent_state.current_term = data.term;
+                    context.persistent_state.voted_for = None;
+                    return become_follower(config, context)
+                } else {
+                    return Role::Leader(leader)
+                }
             },
             RaftMessage::RequestVote(data) => {
                 println!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
                 return handle_request_vote(&data, &message.peer, Role::Leader(leader), outbound_channel, config, context)
             },
-            RaftMessage::RequestVoteResponse(_) => {
+            RaftMessage::RequestVoteResponse(data) => {
+                println!("L {}: RequestVoteResponse from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
                 // Ignore for now
+                return Role::Leader(leader)
             }
         }
     }
