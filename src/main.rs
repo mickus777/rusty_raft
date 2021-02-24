@@ -1,5 +1,5 @@
 use rand::Rng;
-use std::convert::TryFrom;
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io;
@@ -17,16 +17,25 @@ use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
-    peers: Vec<i32>,
     candidate_timeout: u64,
     candidate_resend_timeout: u64,
 
     election_timeout_length: u64,
-    idle_timeout_length: u64
+    idle_timeout_length: u64,
+
+    peers: HashMap<String, String>
 }
 
 impl ::std::default::Default for Config {
-    fn default() -> Self { Self { peers: vec![], candidate_timeout: 10000, candidate_resend_timeout: 2000, election_timeout_length: 10000, idle_timeout_length: 1000 }}
+    fn default() -> Self { 
+        Self { 
+            candidate_timeout: 10000, 
+            candidate_resend_timeout: 2000, 
+            election_timeout_length: 10000, 
+            idle_timeout_length: 1000,
+            peers: HashMap::new()
+        }
+    }
 }
 
 enum SystemMessage {
@@ -43,22 +52,18 @@ enum RaftMessage {
 #[derive(Clone)]
 struct AppendEntriesData {
     term: u64,
-    leader: i32    
 }
 
 struct AppendEntriesResponseData {
     term: u64,
-    responder: i32
 }
 
 struct RequestVoteData {
-    candidate: i32,
     term: u64
 }
 
 struct RequestVoteResponseData {
-    success: bool,
-    acceptor: i32
+    success: bool
 }
 
 impl Clone for RaftMessage {
@@ -94,25 +99,12 @@ struct Context {
 
 struct DataMessage {
     raft_message: RaftMessage,
-    address: String
+    peer: String
 }
 
 fn usage() {
-    println!("Usage: rusty-raft '[NAME]' [OWN_PORT] [KNOWN_PORTS]");
+    println!("Usage: rusty-raft '[NAME]'");
     println!("     NAME is the name of this server.");
-    println!("     OWN_PORT is the port of this server.");
-    println!("     KNOWN_PORTS is a comma-separated list of other member ports.");
-}
-
-fn parse_port(port: &str) -> i32 {
-    match port.trim().parse::<i32>() {
-        Ok(p) => p,
-        Err(_) => {
-            println!("Invalid port: {}, must be a number.", port);
-            usage();
-            panic!("Aborting!");
-        }
-    }
 }
 
 fn main() {
@@ -130,25 +122,15 @@ fn main() {
         }
     };
 
-    let port = match arguments.next() {
-        Some(arg) => arg,
-        None => {
-            println!("Invalid own-port-parameter.");
-            usage();
-            panic!("Aborting!");
-        }
-    };
-    let port = parse_port(&port[..]);
-
     let mut config : Config = confy::load("rusty_raft").unwrap();
     if config.peers.len() < 3 {
-        println!("Invalid list of peer ports. Three are required.");
+        println!("Invalid list of peers. At least three are required.");
         usage();
         panic!("Aborting!");
     }
-    config.peers = config.peers.into_iter().filter(|&peer| peer != port).collect();
+    let local_address = config.peers.remove(&name).unwrap();
 
-    println!("{} {} {:?}", name, port, config.peers);
+    println!("Starting {}", name);
 
     let (inbound_channel_entrance, inbound_channel_exit) = mpsc::channel();
     let (outbound_channel_entrance, outbound_channel_exit) = mpsc::channel();
@@ -156,11 +138,10 @@ fn main() {
     let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
-    let max_timeout : u64 = 10;
-
-    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, port); });
+    let udp_peers = config.peers.clone();
+    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, udp_peers); });
     let loop_handle = thread::spawn(move || { 
-        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &port, &config); 
+        main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &config); 
     });
 
     let mut buffer = String::new();
@@ -178,10 +159,11 @@ fn main() {
     println!("Node exiting!");
 }
 
-fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Sender<DataMessage>, outbound_channel: mpsc::Receiver<DataMessage>, port: i32) {
-    let address = format!("127.0.0.1:{}", port);
+fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Sender<DataMessage>, outbound_channel: mpsc::Receiver<DataMessage>, local_address: String, peers: HashMap<String, String>) {
+    let value_lookup = peers.iter().map(|(key, value)| (value, key)).collect::<HashMap<&String, &String>>();
+    println!("{}", local_address);
 
-    let mut socket = UdpSocket::bind(&address);
+    let mut socket = UdpSocket::bind(&local_address);
     if let Ok(s) = &mut socket {
         s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
     }
@@ -195,19 +177,23 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc
         match &socket {
             Result::Ok(sock) => {
                 if let Ok(msg) = outbound_channel.try_recv() {
-                    sock.send_to(serialize(&msg.raft_message).as_bytes(), msg.address).unwrap();
+                    sock.send_to(serialize(&msg.raft_message).as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
                 }
 
-                let mut buf = [0; 100];
+                let mut buf = [0; 4096];
                 if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
                     if number_of_bytes > 0 {
-                        inbound_channel.send(DataMessage { raft_message: parse(str::from_utf8(&buf).unwrap().trim_matches(char::from(0))), address: source_address.to_string() }).unwrap();
+                        inbound_channel.send(DataMessage { 
+                            raft_message: parse(str::from_utf8(&buf).unwrap().trim_matches(char::from(0))), 
+                            peer: (*value_lookup.get(&source_address.to_string()).unwrap()).clone()
+                        }).unwrap();
                     }
                 }
             }
             Result::Err(msg) => {
                 println!("Failed to bind socket: {}", msg);
-                socket = UdpSocket::bind(&address);
+                thread::sleep(Duration::from_millis(1000));
+                socket = UdpSocket::bind(&local_address);
                 if let Ok(s) = &mut socket {
                     s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
                 }
@@ -222,23 +208,19 @@ fn parse(message : &str) -> RaftMessage {
         Value::Object(map) => {
             if let Some(candidate) = map.get("request_vote") {
                 RaftMessage::RequestVote(RequestVoteData {
-                    candidate: parse_i32(candidate.get("candidate").unwrap()), 
                     term: parse_u64(candidate.get("term").unwrap())
                 })
             } else if let Some(request_vote_response) = map.get("request_vote_response") {
                 RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
-                    success: request_vote_response.get("success").unwrap() == "true",
-                    acceptor: parse_i32(request_vote_response.get("acceptor").unwrap()) 
+                    success: request_vote_response.get("success").unwrap() == "true"
                 })
             } else if let Some(append_entries) = map.get("append_entries") {
                 RaftMessage::AppendEntries(AppendEntriesData {
-                    term: parse_u64(append_entries.get("term").unwrap()),
-                    leader: parse_i32(append_entries.get("leader").unwrap())
+                    term: parse_u64(append_entries.get("term").unwrap())
                 })
             } else if let Some(append_entries_response) = map.get("append_entries_response") {
                 RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
-                    term: parse_u64(append_entries_response.get("term").unwrap()),
-                    responder: parse_i32(append_entries_response.get("responder").unwrap())
+                    term: parse_u64(append_entries_response.get("term").unwrap())
                 })
             } else {
                 panic!("Not handled {}", message);
@@ -246,17 +228,6 @@ fn parse(message : &str) -> RaftMessage {
         },
         _ => {
             panic!("Invalid json!");
-        }
-    }
-}
-
-fn parse_i32(value: &serde_json::Value) -> i32 {
-    match value {
-        serde_json::Value::Number(i) => {
-            i32::try_from(i.as_i64().unwrap()).unwrap()
-        },
-        _ => {
-            panic!("Not a number");
         }
     }
 }
@@ -277,23 +248,20 @@ fn serialize(message : &RaftMessage) -> String {
         RaftMessage::AppendEntries(data) => {
             json!({
                 "append_entries": json!({
-                    "term": data.term,
-                    "leader": data.leader
+                    "term": data.term
                 })
             }).to_string()
         },
         RaftMessage::AppendEntriesResponse(data) => {
             json!({
                 "append_entries_response": json!({
-                    "term": data.term,
-                    "responder": data.responder
+                    "term": data.term
                 })
             }).to_string()
         },
         RaftMessage::RequestVote(data) => {
             json!({
                 "request_vote": json!({
-                    "candidate": data.candidate,
                     "term": data.term
                 })
             }).to_string()
@@ -301,8 +269,7 @@ fn serialize(message : &RaftMessage) -> String {
         RaftMessage::RequestVoteResponse(data) => {
             json!({
                 "request_vote_response": json!({
-                    "success": if data.success { "true" } else { "false" },
-                    "acceptor": data.acceptor
+                    "success": if data.success { "true" } else { "false" }
                 })
             }).to_string()
         }
@@ -310,24 +277,20 @@ fn serialize(message : &RaftMessage) -> String {
 }
 
 struct FollowerData {
-    host_port: i32,
     election_timeout: Instant,
     election_timeout_length: u128,
 }
 
 struct CandidateData {
-    host_port: i32,
     election_timeout: Instant,
     election_timeout_length: u128,
     last_send_time: Option<Instant>,
     resend_timeout_length: u128,
-    peers_approving: Vec<i32>,
-    peers_undecided: Vec<i32>
+    peers_approving: Vec<String>,
+    peers_undecided: Vec<String>
 }
 
 struct LeaderData {
-    host_port: i32,
-    peers: Vec<i32>,
     idle_timeout: Option<Instant>,
     idle_timeout_length: u128
 }
@@ -345,9 +308,8 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
             RaftMessage::AppendEntries(data) => {
                 println!("F {}: Received append entries, term: {}", context.term, data.term);
                 context.term = data.term;
-                send_append_entries_response(&context.term, &follower.host_port, &data.leader, outbound_channel);
+                send_append_entries_response(&context.term, &msg.peer, outbound_channel);
                 return Role::Follower(FollowerData{
-                    host_port: follower.host_port,
                     election_timeout: Instant::now(),
                     election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
@@ -356,11 +318,10 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
                 // Old or misguided message, ignore
             },
             RaftMessage::RequestVote(data) => {
-                println!("F {}: Accept candidacy of {} with term: {}", context.term, data.candidate, data.term);
+                println!("F {}: Accept candidacy of {} with term: {}", context.term, msg.peer, data.term);
                 context.term = data.term;
-                send_request_vote_response(&follower.host_port, &data.candidate, outbound_channel);
+                send_request_vote_response(&msg.peer, outbound_channel);
                 return Role::Follower(FollowerData{
-                    host_port: follower.host_port,
                     election_timeout: Instant::now(),
                     election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
                 })
@@ -375,13 +336,12 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
         println!("F {}: Timeout!", context.term);
         context.term += 1;
         Role::Candidate(CandidateData{ 
-            host_port: follower.host_port,
             election_timeout: Instant::now(), 
             election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
             last_send_time: None, 
             resend_timeout_length: u128::from(config.candidate_resend_timeout),
             peers_approving: Vec::new(),
-            peers_undecided: config.peers.clone()
+            peers_undecided: config.peers.keys().cloned().collect::<Vec<String>>()
         })
     } else {
         println!("F {}: Timeout in {}", context.term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
@@ -391,14 +351,14 @@ fn tick_follower(follower: FollowerData, inbound_channel: &mpsc::Receiver<DataMe
 
 fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
     if let Ok(message) = inbound_channel.try_recv() {
-        match message.raft_message {
+        match &message.raft_message {
             RaftMessage::RequestVote(_) => {
                 panic!("Not implemented");
             },
             RaftMessage::RequestVoteResponse(data) => {
-                candidate.peers_undecided.retain(|peer| *peer != data.acceptor);
+                candidate.peers_undecided.retain(|peer| *peer != message.peer);
                 if data.success {
-                    candidate.peers_approving.push(data.acceptor);
+                    candidate.peers_approving.push(message.peer);
                 }
             },
             RaftMessage::AppendEntries(_) => {
@@ -413,8 +373,6 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
     if candidate.peers_approving.len() >= config.peers.len() / 2 {
         println!("C {}: Elected!", context.term);
         return Role::Leader(LeaderData{
-            host_port: candidate.host_port,
-            peers: config.peers.clone(),
             idle_timeout: None,
             idle_timeout_length: u128::from(config.idle_timeout_length)
         })
@@ -422,18 +380,18 @@ fn tick_candidate(mut candidate: CandidateData, inbound_channel: &mpsc::Receiver
 
     if candidate.last_send_time.is_none() || candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
         println!("C {}: Broadcast candidacy", context.term);
-        broadcast_request_vote(&candidate, &context.term, outbound_channel);
         candidate.peers_approving = Vec::new();
-        candidate.peers_undecided = config.peers.clone();
+        candidate.peers_undecided = config.peers.keys().cloned().collect::<Vec<String>>();
         candidate.election_timeout = Instant::now();
         candidate.election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
         candidate.last_send_time = Some(Instant::now());
+        broadcast_request_vote(&context.term, &candidate.peers_undecided, outbound_channel);
         return Role::Candidate(candidate)
     }
 
     if candidate.last_send_time.unwrap().elapsed().as_millis() > candidate.resend_timeout_length {
         println!("C {}: Rebroadcast candidacy", context.term);
-        rebroadcast_request_vote(&candidate, &context.term, outbound_channel);
+        rebroadcast_request_vote(&context.term, &candidate.peers_undecided, outbound_channel);
         candidate.last_send_time = Some(Instant::now());
     }
 
@@ -448,7 +406,7 @@ fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMess
                 panic!("Not implemented");
             },
             RaftMessage::AppendEntriesResponse(data) => {
-                println!("T: {}, append entries response: {} from {}", context.term, data.term, data.responder)
+                println!("L: {}, append entries response: {} from {}", context.term, data.term, msg.peer)
             },
             RaftMessage::RequestVote(_) => {
                 panic!("Not implemented");
@@ -461,7 +419,7 @@ fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMess
 
     if leader.idle_timeout.is_none() || leader.idle_timeout.unwrap().elapsed().as_millis() > leader.idle_timeout_length {
         println!("L {}: Broadcast AppendEntries Idle", context.term);
-        broadcast_append_entries_idle(&leader, &context.term, outbound_channel);
+        broadcast_append_entries_idle(&context.term, &config.peers.keys().map(|key| key.clone()).collect::<Vec<String>>(), outbound_channel);
         leader.idle_timeout = Some(Instant::now());
         return Role::Leader(leader)
     }
@@ -469,52 +427,60 @@ fn tick_leader(mut leader: LeaderData, inbound_channel: &mpsc::Receiver<DataMess
     Role::Leader(leader)
 }
 
-fn broadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
-    for peer in candidate.peers_undecided.iter() {
-        send_request_vote(&candidate.host_port, term, peer, outbound_channel);
+fn broadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
+    for peer in peers.iter() {
+        send_request_vote(term, peer, outbound_channel);
     }
 }
 
-fn rebroadcast_request_vote(candidate: &CandidateData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
-    for peer in candidate.peers_undecided.iter() {
-        send_request_vote(&candidate.host_port, term, peer, outbound_channel);
+fn rebroadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
+    for peer in peers.iter() {
+        send_request_vote(term, peer, outbound_channel);
     }
 }
 
-fn broadcast_append_entries_idle(leader: &LeaderData, term: &u64, outbound_channel: &mpsc::Sender<DataMessage>) {
-    for peer in leader.peers.iter() {
-        send_append_entries_idle(term, &leader.host_port, peer, outbound_channel);
+fn broadcast_append_entries_idle(term: &u64, followers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
+    for follower in followers.iter() {
+        send_append_entries_idle(term, follower, outbound_channel);
     }
 }
 
-fn send_request_vote(node: &i32, term: &u64, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_request_vote(term: &u64, peer: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
     println!("T {}: Send request vote to: {}", term, peer);
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVote(RequestVoteData{ 
-        candidate: *node, 
-        term: *term
-    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+    outbound_channel.send(DataMessage { 
+        raft_message: RaftMessage::RequestVote(RequestVoteData{ 
+            term: *term
+        }), 
+        peer: (*peer).clone()
+    }).unwrap();
 }
 
-fn send_request_vote_response(node: &i32, candidate: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
-        success: true, 
-        acceptor: *node 
-    }), address: format!("127.0.0.1:{}", candidate) }).unwrap();
+fn send_request_vote_response(candidate: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+    outbound_channel.send(DataMessage { 
+        raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
+            success: true
+        }), 
+        peer: (*candidate).clone()
+    }).unwrap();
 }
 
-fn send_append_entries_idle(term: &u64, leader: &i32, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::AppendEntries(AppendEntriesData{
-        term: *term,
-        leader: *leader
-    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+fn send_append_entries_idle(term: &u64, follower: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+    outbound_channel.send(DataMessage { 
+        raft_message: RaftMessage::AppendEntries(AppendEntriesData {
+            term: *term
+        }),
+        peer: (*follower).clone()
+    }).unwrap();
 }
 
-fn send_append_entries_response(term: &u64, responder: &i32, peer: &i32, outbound_channel: &mpsc::Sender<DataMessage>) {
-    println!("Sending {} to {}", term, peer);
-    outbound_channel.send(DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
-        term: *term,
-        responder: *responder
-    }), address: format!("127.0.0.1:{}", peer) }).unwrap();
+fn send_append_entries_response(term: &u64, leader: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+    println!("Sending {} to {}", term, leader);
+    outbound_channel.send(DataMessage { 
+        raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
+            term: *term
+        }), 
+        peer: (*leader).clone()
+    }).unwrap();
 }
 
 fn tick(role: Role, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &Config, context: &mut Context) -> Role {
@@ -535,7 +501,7 @@ fn randomize_timeout(base: &u64, random: &mut rand::rngs::ThreadRng) -> u128 {
     u128::from(base + random.gen_range(1..*base))
 }
 
-fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, host_port: &i32, config: &Config) {
+fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, config: &Config) {
 
     let mut context = Context { 
         random: rand::thread_rng(),
@@ -544,7 +510,10 @@ fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mps
 
     let election_timeout_length = randomize_timeout(&config.election_timeout_length, &mut context.random);
 
-    let mut role = Role::Follower(FollowerData{ host_port: *host_port, election_timeout: Instant::now(), election_timeout_length });
+    let mut role = Role::Follower(FollowerData{ 
+        election_timeout: Instant::now(), 
+        election_timeout_length 
+    });
 
     loop {
         if let Ok(_) = system_channel.try_recv() {
