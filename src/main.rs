@@ -133,6 +133,13 @@ fn main() {
         }
     };
 
+    let mut bad_connection = false;
+    if let Some(arg) = arguments.next() {
+        if arg == "--simulate-bad-connection" || arg == "-s" {
+            bad_connection = true;
+        }
+    }
+
     let config : Config = confy::load("rusty_raft").unwrap();
 
     let timeout_config = TimeoutConfig {
@@ -159,7 +166,7 @@ fn main() {
     let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
-    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, peers); });
+    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, peers, bad_connection); });
     let loop_handle = thread::spawn(move || { 
         main_loop(loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &timeout_config, peer_names); 
     });
@@ -179,7 +186,13 @@ fn main() {
     println!("Node exiting!");
 }
 
-fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Sender<DataMessage>, outbound_channel: mpsc::Receiver<DataMessage>, local_address: String, peers: HashMap<String, String>) {
+fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, 
+    inbound_channel: mpsc::Sender<DataMessage>, 
+    outbound_channel: mpsc::Receiver<DataMessage>, 
+    local_address: String, 
+    peers: HashMap<String, String>,
+    bad_connection: bool) {
+
     let value_lookup = peers.iter().map(|(key, value)| (value, key)).collect::<HashMap<&String, &String>>();
     println!("{}", local_address);
 
@@ -187,6 +200,10 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc
     if let Ok(s) = &mut socket {
         s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
     }
+
+    let mut random = rand::thread_rng();
+    let bad_connection_chance = 0.05;
+    let mut transfers_to_miss = 0;
 
     loop {
         if let Ok(SystemMessage::Close) = system_channel.try_recv() {
@@ -197,16 +214,32 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc
         match &socket {
             Result::Ok(sock) => {
                 if let Ok(msg) = outbound_channel.try_recv() {
-                    sock.send_to(serialize(&msg.raft_message).as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
+                    if bad_connection && transfers_to_miss > 0 {
+                        println!("Dropped outgoing package!");
+                        transfers_to_miss -= 1;
+                    } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
+                        println!("Dropped outgoing package!");
+                        transfers_to_miss = random.gen_range(1..20);
+                    } else {
+                        sock.send_to(serialize(&msg.raft_message).as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
+                    }
                 }
 
                 let mut buf = [0; 4096];
                 if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
                     if number_of_bytes > 0 {
-                        inbound_channel.send(DataMessage { 
-                            raft_message: parse(str::from_utf8(&buf).unwrap().trim_matches(char::from(0))), 
-                            peer: (*value_lookup.get(&source_address.to_string()).unwrap()).clone()
-                        }).unwrap();
+                        if bad_connection && transfers_to_miss > 0 {
+                            println!("Dropped incoming package!");
+                            transfers_to_miss -= 1;
+                        } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
+                            println!("Dropped incoming package!");
+                            transfers_to_miss = random.gen_range(1..20);
+                        } else {
+                            inbound_channel.send(DataMessage { 
+                                raft_message: parse(str::from_utf8(&buf).unwrap().trim_matches(char::from(0))), 
+                                peer: (*value_lookup.get(&source_address.to_string()).unwrap()).clone()
+                            }).unwrap();
+                        }
                     }
                 }
             }
@@ -448,8 +481,13 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
 
     if let Ok(message) = inbound_channel.try_recv() {
         match message.raft_message {
-            RaftMessage::AppendEntries(_) => {
-                panic!("Not implemented");
+            RaftMessage::AppendEntries(data) => {
+                println!("L {}: append entries from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
+                context.persistent_state.current_term = data.term;
+                return Role::Follower(FollowerData{
+                    election_timeout: Instant::now(),
+                    election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random)
+                })
             },
             RaftMessage::AppendEntriesResponse(data) => {
                 println!("L {}: append entries response: {} from {}", context.persistent_state.current_term, data.term, message.peer)
@@ -558,7 +596,11 @@ fn randomize_timeout(base: &u64, random: &mut rand::rngs::ThreadRng) -> u128 {
     u128::from(base + random.gen_range(1..*base))
 }
 
-fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, inbound_channel: mpsc::Receiver<DataMessage>, outbound_channel: mpsc::Sender<DataMessage>, config: &TimeoutConfig, peers: Vec<String>) {
+fn main_loop(system_channel: mpsc::Receiver<SystemMessage>, 
+    inbound_channel: mpsc::Receiver<DataMessage>, 
+    outbound_channel: mpsc::Sender<DataMessage>, 
+    config: &TimeoutConfig, 
+    peers: Vec<String>) {
 
     let mut context = Context { 
         random: rand::thread_rng(),
