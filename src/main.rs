@@ -1,5 +1,6 @@
 use rand::Rng;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::env;
 use std::fmt;
 use std::io;
@@ -52,14 +53,21 @@ enum RaftMessage {
 #[derive(Clone)]
 struct AppendEntriesData {
     term: u64,
+    prev_log_index: usize,
+    prev_log_term: Option<u64>,
+    entries: Vec<LogPost>,
+    leader_commit: usize
 }
 
 struct AppendEntriesResponseData {
     term: u64,
+    success: bool
 }
 
 struct RequestVoteData {
-    term: u64
+    term: u64,
+    last_log_index: usize,
+    last_log_term: Option<u64>
 }
 
 struct RequestVoteResponseData {
@@ -96,17 +104,34 @@ impl fmt::Display for RaftMessage {
 struct Context {
     name: String,
     random: rand::rngs::ThreadRng,
-    persistent_state: PersistentState
+    persistent_state: PersistentState,
+    volatile_state: VolatileState
+}
+
+#[derive(Clone)]
+struct LogPost {
+    term: u64,
+    value: i32
 }
 
 struct PersistentState {
     current_term: u64,
-    voted_for: Option<String>
+    voted_for: Option<String>,
+    log: Vec<LogPost>
+}
+
+struct VolatileState {
+    commit_index: usize,
+    last_applied: usize
 }
 
 struct DataMessage {
     raft_message: RaftMessage,
     peer: String
+}
+
+struct LogMessage {
+    value: i32
 }
 
 fn usage() {
@@ -157,18 +182,32 @@ fn main() {
 
     let (inbound_channel_entrance, inbound_channel_exit) = mpsc::channel();
     let (outbound_channel_entrance, outbound_channel_exit) = mpsc::channel();
+    let (log_channel, log_channel_reader) = mpsc::channel();
 
     let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
     let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, peers, bad_connection); });
-    let loop_handle = thread::spawn(move || { 
-        main_loop(name, loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, &timeout_config, peer_names); 
-    });
+    let loop_handle = thread::spawn(move || { main_loop(name, loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, log_channel_reader, &timeout_config, peer_names); });
 
-    let mut buffer = String::new();
     let stdin = io::stdin();
-    stdin.read_line(&mut buffer).unwrap();
+    loop {
+        let mut buffer = String::new();
+        stdin.read_line(&mut buffer).unwrap();
+        if buffer.trim().len() > 0 {
+            match buffer.trim().parse::<i32>() {
+                Ok(value) => {
+                    log_channel.send(LogMessage { value }).unwrap();
+                },
+                Err(_) => {
+                    println!("Invalid log value: {}", buffer);
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
 
     println!("Initiating exit.");
 
@@ -256,7 +295,9 @@ fn parse(message : &str) -> RaftMessage {
         Value::Object(map) => {
             if let Some(candidate) = map.get("request_vote") {
                 RaftMessage::RequestVote(RequestVoteData {
-                    term: parse_u64(candidate.get("term").unwrap())
+                    term: parse_u64(candidate.get("term").unwrap()),
+                    last_log_index: parse_usize(candidate.get("last_log_index").unwrap()),
+                    last_log_term: parse_option_u64(candidate.get("last_log_term").unwrap())
                 })
             } else if let Some(request_vote_response) = map.get("request_vote_response") {
                 RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
@@ -265,18 +306,58 @@ fn parse(message : &str) -> RaftMessage {
                 })
             } else if let Some(append_entries) = map.get("append_entries") {
                 RaftMessage::AppendEntries(AppendEntriesData {
-                    term: parse_u64(append_entries.get("term").unwrap())
+                    term: parse_u64(append_entries.get("term").unwrap()),
+                    prev_log_index: parse_usize(append_entries.get("prev_log_index").unwrap()),
+                    prev_log_term: parse_option_u64(append_entries.get("prev_log_term").unwrap()),
+                    entries: parse_entries(append_entries.get("entries").unwrap()),
+                    leader_commit: parse_usize(append_entries.get("leader_commit").unwrap())
                 })
             } else if let Some(append_entries_response) = map.get("append_entries_response") {
                 RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
-                    term: parse_u64(append_entries_response.get("term").unwrap())
+                    term: parse_u64(append_entries_response.get("term").unwrap()),
+                    success: append_entries_response.get("success").unwrap() == "true"
                 })
             } else {
                 panic!("Not handled {}", message);
             }
         },
-        _ => {
+        _ => {  
             panic!("Invalid json!");
+        }
+    }
+}
+
+fn parse_entry(value: &serde_json::Value) -> LogPost {
+    match value {
+        serde_json::Value::Object(map) => {
+            LogPost {
+                term: parse_u64(map.get("term").unwrap()),
+                value: parse_i32(map.get("value").unwrap())
+            }
+        },
+        _ => {
+            panic!("Not a valid entry");
+        }
+    }
+}
+
+fn parse_entries(value: &serde_json::Value) -> Vec<LogPost> {
+    match value {
+        serde_json::Value::Array(array) => {
+            array.iter().map(|value| parse_entry(value)).collect()
+        },
+        _ => {
+            panic!("Not a valid entry list");
+        }
+    }
+}
+
+fn parse_option_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(_) => Some(parse_u64(value)),
+        serde_json::Value::Null => None,
+        _ => {
+            panic!("Unknown value");
         }
     }
 }
@@ -287,7 +368,29 @@ fn parse_u64(value: &serde_json::Value) -> u64 {
             i.as_u64().unwrap()
         },
         _ => {
-            panic!("Not a number");
+            panic!("Not a u64");
+        }
+    }
+}
+
+fn parse_i32(value: &serde_json::Value) -> i32 {
+    match value {
+        serde_json::Value::Number(i) => {
+            i32::try_from(i.as_u64().unwrap()).unwrap()
+        },
+        _ => {
+            panic!("Not an i32");
+        }
+    }
+}
+
+fn parse_usize(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Number(i) => {
+            usize::try_from(i.as_u64().unwrap()).unwrap()
+        },
+        _ => {
+            panic!("Not a usize");
         }
     }
 }
@@ -297,21 +400,34 @@ fn serialize(message : &RaftMessage) -> String {
         RaftMessage::AppendEntries(data) => {
             json!({
                 "append_entries": json!({
-                    "term": data.term
-                })
+                    "term": data.term,
+                    "prev_log_index": data.prev_log_index,
+                    "prev_log_term": match data.prev_log_term {
+                        Some(term) => json!(term),
+                        None => serde_json::Value::Null,
+                    },
+                    "entries": data.entries.iter().map(|entry| json!({ "term": entry.term, "value": entry.value })).collect::<serde_json::Value>(),
+                    "leader_commit": data.leader_commit
+                }) 
             }).to_string()
         },
         RaftMessage::AppendEntriesResponse(data) => {
             json!({
                 "append_entries_response": json!({
-                    "term": data.term
+                    "term": data.term,
+                    "success": if data.success { "true" } else { "false" }
                 })
             }).to_string()
         },
         RaftMessage::RequestVote(data) => {
-            json!({
+            json!({ 
                 "request_vote": json!({
-                    "term": data.term
+                    "term": data.term,
+                    "last_log_index": data.last_log_index,
+                    "last_log_term": match data.last_log_term {
+                        Some(term) => json!(term),
+                        None => serde_json::Value::Null
+                    }
                 })
             }).to_string()
         },
@@ -349,7 +465,17 @@ enum Role {
     Leader(LeaderData)
 }
 
-fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
+fn tick_follower(follower: FollowerData, 
+    peers: &Vec<String>, 
+    inbound_channel: &mpsc::Receiver<DataMessage>, 
+    outbound_channel: &mpsc::Sender<DataMessage>, 
+    log_channel: &mpsc::Receiver<LogMessage>,
+    config: &TimeoutConfig, 
+    context: &mut Context) -> Role {
+
+    if let Ok(message) = log_channel.try_recv() {
+        println!("Follower can not handle message: {}", message.value)
+    }
 
     if let Ok(msg) = inbound_channel.try_recv() {
         match msg.raft_message {
@@ -359,7 +485,7 @@ fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
                 }
-                send_append_entries_response(&context.persistent_state.current_term, &msg.peer, outbound_channel);
+                send_append_entries_response(&context.persistent_state.current_term, &true, &msg.peer, outbound_channel);
                 become_follower(config, context)
             },
             RaftMessage::AppendEntriesResponse(data) => {
@@ -388,7 +514,18 @@ fn tick_follower(follower: FollowerData, peers: &Vec<String>, inbound_channel: &
     }
 }
 
-fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
+fn tick_candidate(mut candidate: CandidateData, 
+    peers: &Vec<String>, 
+    inbound_channel: &mpsc::Receiver<DataMessage>, 
+    outbound_channel: &mpsc::Sender<DataMessage>, 
+    log_channel: &mpsc::Receiver<LogMessage>,
+    config: &TimeoutConfig, 
+    context: &mut Context) -> Role {
+
+    if let Ok(message) = log_channel.try_recv() {
+        println!("Candidate can not handle message: {}", message.value)
+    }
+
     if let Ok(message) = inbound_channel.try_recv() {
         match &message.raft_message {
             RaftMessage::RequestVote(data) => {
@@ -414,10 +551,10 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
                 if data.term >= context.persistent_state.current_term {
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
-                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    send_append_entries_response(&context.persistent_state.current_term, &true, &message.peer, outbound_channel);
                     become_follower(config, context)
                 } else {
-                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    send_append_entries_response(&context.persistent_state.current_term, &false, &message.peer, outbound_channel);
                     Role::Candidate(candidate)
                 }
             },
@@ -441,19 +578,28 @@ fn tick_candidate(mut candidate: CandidateData, peers: &Vec<String>, inbound_cha
     }
 }
 
-fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
+fn tick_leader(mut leader: LeaderData, 
+    peers: &Vec<String>, 
+    inbound_channel: &mpsc::Receiver<DataMessage>, 
+    outbound_channel: &mpsc::Sender<DataMessage>, 
+    log_channel: &mpsc::Receiver<LogMessage>,
+    config: &TimeoutConfig, 
+    context: &mut Context) -> Role {
 
-    if let Ok(message) = inbound_channel.try_recv() {
+    if let Ok(message) = log_channel.try_recv() {
+        println!("Leader can not handle message: {}", message.value);
+        Role::Leader(leader)
+    } else if let Ok(message) = inbound_channel.try_recv() {
         match message.raft_message {
             RaftMessage::AppendEntries(data) => {
                 println!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, message.peer, data.term);
                 if data.term > context.persistent_state.current_term {
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
-                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    send_append_entries_response(&context.persistent_state.current_term, &true, &message.peer, outbound_channel);
                     become_follower(config, context)
                 } else {
-                    send_append_entries_response(&context.persistent_state.current_term, &message.peer, outbound_channel);
+                    send_append_entries_response(&context.persistent_state.current_term, &false, &message.peer, outbound_channel);
                     Role::Leader(leader)
                 }
             },
@@ -486,7 +632,18 @@ fn tick_leader(mut leader: LeaderData, peers: &Vec<String>, inbound_channel: &mp
     } else {
         if leader.idle_timeout.elapsed().as_millis() > leader.idle_timeout_length {
             println!("L {}: Broadcast AppendEntries Idle", context.persistent_state.current_term);
-            broadcast_append_entries_idle(&context.persistent_state.current_term, peers, outbound_channel);
+            let prev_log_term = match top(&context.persistent_state.log) {
+                Some(post) => Some(post.term),
+                None => None
+            };
+            broadcast_append_entries(
+                &context.persistent_state.current_term, 
+                &context.persistent_state.log.len(), 
+                &prev_log_term,
+                &vec!(),
+                &context.volatile_state.commit_index, 
+                peers, 
+                outbound_channel);
             leader.idle_timeout = Instant::now();
             Role::Leader(leader)
         } else {
@@ -533,7 +690,15 @@ fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
 fn become_candidate(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
     context.persistent_state.current_term += 1;
     context.persistent_state.voted_for = Some(context.name.clone());
-    broadcast_request_vote(&context.persistent_state.current_term, &peers, outbound_channel);
+    let last_log_term = match top(&context.persistent_state.log) {
+        Some(post) => Some(post.term),
+        None => None
+    };
+    broadcast_request_vote(
+        &context.persistent_state.current_term, 
+        &context.persistent_state.log.len(), 
+        &last_log_term,
+        &peers, outbound_channel);
     Role::Candidate(CandidateData {
         election_timeout: Instant::now(), 
         election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
@@ -542,30 +707,50 @@ fn become_candidate(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMes
     })
 }
 
+fn top(list: &Vec<LogPost>) -> Option<&LogPost> {
+    match list.len() {
+        0 => None,
+        n => Some(&list[n-1])
+    }
+}
+
 fn become_leader(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
-    broadcast_append_entries_idle(&context.persistent_state.current_term, peers, outbound_channel);
+    let prev_log_term = match top(&context.persistent_state.log) {
+        Some(post) => Some(post.term),
+        None => None
+    };
+    broadcast_append_entries(
+        &context.persistent_state.current_term, 
+        &context.persistent_state.log.len(),
+        &prev_log_term,
+        &vec!(),
+        &context.volatile_state.commit_index,
+        peers, 
+        outbound_channel);
     Role::Leader(LeaderData {
         idle_timeout: Instant::now(),
         idle_timeout_length: u128::from(config.idle_timeout_length)
     })
 }
 
-fn broadcast_request_vote(term: &u64, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn broadcast_request_vote(term: &u64, last_log_index: &usize, last_log_term: &Option<u64>, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
     for peer in peers.iter() {
-        send_request_vote(term, peer, outbound_channel);
+        send_request_vote(term, last_log_index, last_log_term, peer, outbound_channel);
     }
 }
 
-fn broadcast_append_entries_idle(term: &u64, followers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn broadcast_append_entries(term: &u64, prev_log_index: &usize, prev_log_term: &Option<u64>, entries: &Vec<LogPost>, leader_commit: &usize, followers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>) {
     for follower in followers.iter() {
-        send_append_entries_idle(term, follower, outbound_channel);
+        send_append_entries(term, prev_log_index, prev_log_term, entries, leader_commit, follower, outbound_channel);
     }
 }
 
-fn send_request_vote(term: &u64, peer: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_request_vote(term: &u64, last_log_index: &usize, last_log_term: &Option<u64>, peer: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
     outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::RequestVote(RequestVoteData{ 
-            term: *term
+            term: *term,
+            last_log_index: *last_log_index,
+            last_log_term: *last_log_term
         }), 
         peer: (*peer).clone()
     }).unwrap();
@@ -581,34 +766,45 @@ fn send_request_vote_response(term: &u64, vote_granted: bool, candidate: &String
     }).unwrap();
 }
 
-fn send_append_entries_idle(term: &u64, follower: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_append_entries(term: &u64, prev_log_index: &usize, prev_log_term: &Option<u64>, entries: &Vec<LogPost>, leader_commit: &usize, follower: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
     outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::AppendEntries(AppendEntriesData {
-            term: *term
+            term: *term,
+            prev_log_index: *prev_log_index,
+            prev_log_term: *prev_log_term,
+            entries: entries.clone(),
+            leader_commit: *leader_commit
         }),
         peer: (*follower).clone()
     }).unwrap();
 }
 
-fn send_append_entries_response(term: &u64, leader: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
+fn send_append_entries_response(term: &u64, success: &bool, leader: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
     outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
-            term: *term
+            term: *term,
+            success: *success
         }), 
         peer: (*leader).clone()
     }).unwrap();
 }
 
-fn tick(role: Role, peers: &Vec<String>, inbound_channel: &mpsc::Receiver<DataMessage>, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
+fn tick(role: Role, 
+    peers: &Vec<String>, 
+    inbound_channel: &mpsc::Receiver<DataMessage>, 
+    outbound_channel: &mpsc::Sender<DataMessage>, 
+    log_channel: &mpsc::Receiver<LogMessage>,
+    config: &TimeoutConfig, 
+    context: &mut Context) -> Role {
     match role {
         Role::Follower(data) => {
-            tick_follower(data, peers, inbound_channel, outbound_channel, config, context)
+            tick_follower(data, peers, inbound_channel, outbound_channel, log_channel, config, context)
         }
         Role::Candidate(data) => {
-            tick_candidate(data, peers, inbound_channel, outbound_channel, config, context)
+            tick_candidate(data, peers, inbound_channel, outbound_channel, log_channel, config, context)
         }
         Role::Leader(data) => {
-            tick_leader(data, peers, inbound_channel, outbound_channel, config, context)
+            tick_leader(data, peers, inbound_channel, outbound_channel, log_channel, config, context)
         }
     }
 }
@@ -620,6 +816,7 @@ fn randomize_timeout(base: &u64, random: &mut rand::rngs::ThreadRng) -> u128 {
 fn main_loop(name: String, system_channel: mpsc::Receiver<SystemMessage>, 
     inbound_channel: mpsc::Receiver<DataMessage>, 
     outbound_channel: mpsc::Sender<DataMessage>, 
+    log_channel: mpsc::Receiver<LogMessage>,
     config: &TimeoutConfig, 
     peers: Vec<String>) {
 
@@ -628,7 +825,12 @@ fn main_loop(name: String, system_channel: mpsc::Receiver<SystemMessage>,
         random: rand::thread_rng(),
         persistent_state: PersistentState {
             current_term: 0,
-            voted_for: None
+            voted_for: None,
+            log: vec!()
+        },
+        volatile_state: VolatileState {
+            commit_index: 0,
+            last_applied: 0
         }
     };
 
@@ -645,7 +847,7 @@ fn main_loop(name: String, system_channel: mpsc::Receiver<SystemMessage>,
             break;
         }
 
-        role = tick(role, &peers, &inbound_channel, &outbound_channel, config, &mut context);
+        role = tick(role, &peers, &inbound_channel, &outbound_channel, &log_channel, config, &mut context);
 
         thread::sleep(Duration::from_millis(1000));
     }
