@@ -108,7 +108,7 @@ struct Context {
     volatile_state: VolatileState
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct LogPost {
     term: u64,
     value: i32
@@ -485,7 +485,9 @@ fn tick_follower(follower: FollowerData,
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
                 }
+                context.persistent_state.log.extend(data.entries.iter().cloned().collect::<Vec<LogPost>>());
                 send_append_entries_response(&context.persistent_state.current_term, &true, &msg.peer, outbound_channel);
+                println!("F {}: {:?}", context.persistent_state.current_term, context.persistent_state.log);
                 become_follower(config, context)
             },
             RaftMessage::AppendEntriesResponse(data) => {
@@ -551,7 +553,9 @@ fn tick_candidate(mut candidate: CandidateData,
                 if data.term >= context.persistent_state.current_term {
                     context.persistent_state.current_term = data.term;
                     context.persistent_state.voted_for = None;
+                    context.persistent_state.log.extend(data.entries.iter().cloned().collect::<Vec<LogPost>>());
                     send_append_entries_response(&context.persistent_state.current_term, &true, &message.peer, outbound_channel);
+                    println!("C {}: {:?}", context.persistent_state.current_term, context.persistent_state.log);
                     become_follower(config, context)
                 } else {
                     send_append_entries_response(&context.persistent_state.current_term, &false, &message.peer, outbound_channel);
@@ -587,7 +591,20 @@ fn tick_leader(mut leader: LeaderData,
     context: &mut Context) -> Role {
 
     if let Ok(message) = log_channel.try_recv() {
-        println!("Leader can not handle message: {}", message.value);
+        let prev_log_term = match top(&context.persistent_state.log) {
+            Some(post) => Some(post.term),
+            None => None
+        };
+        context.persistent_state.log.push(LogPost { term: context.persistent_state.current_term, value: message.value });
+        broadcast_append_entries(
+            &context.persistent_state.current_term, 
+            &context.persistent_state.log.len(), 
+            &prev_log_term,
+            &vec!(LogPost { term: context.persistent_state.current_term, value: message.value }),
+            &context.volatile_state.commit_index, 
+            peers, 
+            outbound_channel);
+        println!("L {}: {:?}", context.persistent_state.current_term, context.persistent_state.log);
         Role::Leader(leader)
     } else if let Ok(message) = inbound_channel.try_recv() {
         match message.raft_message {
