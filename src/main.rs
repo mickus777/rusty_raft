@@ -513,6 +513,12 @@ fn get_message_term(message: &RaftMessage) -> u64 {
 }
 
 fn append_entries_from(log: &mut Vec<LogPost>, entries: &Vec<LogPost>, start_pos: &Option<usize>) {
+    if entries.len() == 0 {
+        return
+    } else if log.len() == 0 {
+        log.extend(entries.iter().cloned());
+        return
+    }
     let mut pos_offset = 0;
     let start_pos = start_pos.or(Some(0)).unwrap();
     loop {
@@ -661,7 +667,7 @@ fn tick_candidate(candidate: CandidateData,
     }
 }
 
-fn tick_leader(mut leader: LeaderData, 
+fn tick_leader(leader: LeaderData, 
     peers: &Vec<String>, 
     outbound_channel: &mpsc::Sender<DataMessage>, 
     config: &TimeoutConfig, 
@@ -687,11 +693,19 @@ fn tick_leader(mut leader: LeaderData,
             &context.volatile_state.commit_index, 
             peers, 
             outbound_channel);
+        let mut next_index = HashMap::new();
+        let mut match_index : HashMap<String, Option<usize>> = HashMap::new();
+        for peer in peers.iter() {
+            if context.persistent_state.log.len() > 0 {
+                next_index.insert((*peer).clone(), context.persistent_state.log.len() - 1);
+            }
+            match_index.insert((*peer).clone(), None);
+        }
         Role::Leader(LeaderData {
             idle_timeout: Instant::now(),
             idle_timeout_length: u128::from(config.idle_timeout_length),
-            next_index: HashMap::new(),
-            match_index: HashMap::new()
+            next_index: next_index,
+            match_index: match_index
         })
     //////////////////////////////////////////////////////////////////////////////////////////////
     } else {
@@ -708,9 +722,6 @@ fn tick_leader(mut leader: LeaderData,
                     }
                     send_append_entries(&context.persistent_state.current_term, &prev_log_index, &prev_log_term, &get_log_range(&Some(*next_index), &context.persistent_state.log), &context.volatile_state.commit_index, peer, outbound_channel)
                 }
-            } else {
-                leader.next_index.insert(peer.clone(), context.persistent_state.log.len());
-                leader.match_index.insert(peer.clone(), None);
             }
         }
         //////////////////////////////////////////////////////////////////////////////////////////
@@ -814,6 +825,7 @@ fn become_candidate(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMes
         0 => None,
         _ => Some(context.persistent_state.log.len() - 1)
     };
+    println!("X {}: Broadcast request votes to: {:?}", context.persistent_state.current_term, peers);
     broadcast_request_vote(
         &context.persistent_state.current_term, 
         &last_log_index, 
@@ -846,6 +858,7 @@ fn become_leader(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessag
         0 => None,
         _ => Some(context.persistent_state.log.len())
     };
+    println!("X {}: Broadcast heartbeat to: {:?}", context.persistent_state.current_term, peers);
     broadcast_append_entries(
         &context.persistent_state.current_term, 
         &prev_log_index,
@@ -855,11 +868,19 @@ fn become_leader(peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessag
         peers, 
         outbound_channel);
     //////////////////////////////////////////////////////////////////////////////////////////////
+    let mut next_index = HashMap::new();
+    let mut match_index : HashMap<String, Option<usize>> = HashMap::new();
+    for peer in peers.iter() {
+        if context.persistent_state.log.len() > 0 {
+            next_index.insert((*peer).clone(), context.persistent_state.log.len() - 1);
+        }
+        match_index.insert((*peer).clone(), None);
+    }
     Role::Leader(LeaderData {
         idle_timeout: Instant::now(),
         idle_timeout_length: u128::from(config.idle_timeout_length),
-        next_index: HashMap::new(),
-        match_index: HashMap::new()
+        next_index: next_index,
+        match_index: match_index
     })
 }
 
@@ -928,6 +949,8 @@ fn tick(role: Role,
     config: &TimeoutConfig, 
     context: &mut Context) -> Role {
 
+    println!("X: {:?}", context.persistent_state.log);
+
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: All servers 1
     if let Some(commit_index) = context.volatile_state.commit_index {
@@ -947,18 +970,19 @@ fn tick(role: Role,
         match role {
             Role::Follower(_) => {
                 println!("Follower can not receive incoming data.");
+                role
             },
             Role::Candidate(_) => {
                 println!("Candidate can not receive incoming data.");
+                role
             },
-            Role::Leader(_) => {
+            Role::Leader(leader) => {
                 //////////////////////////////////////////////////////////////////////////////////
                 // Rule: Leader 2
-                leader_receive_log(message.value, peers, outbound_channel, context);
+                leader_receive_log(leader, message.value, context)
                 //////////////////////////////////////////////////////////////////////////////////
             }
         }
-        role
     } else {
         let message = inbound_channel.try_recv();
         if let Ok(message) = message {
@@ -1010,24 +1034,10 @@ fn message_role(role: Role, message: &RaftMessage, peer: &String, outbound_chann
     }
 }
 
-fn leader_receive_log(value: i32, peers: &Vec<String>, outbound_channel: &mpsc::Sender<DataMessage>, context: &mut Context) {
-    let prev_log_term = match top(&context.persistent_state.log) {
-        Some(post) => Some(post.term),
-        None => None
-    };
-    let prev_log_index = match context.persistent_state.log.len() {
-        0 => None,
-        _ => Some(context.persistent_state.log.len() - 1)
-    };
+fn leader_receive_log(mut leader: LeaderData, value: i32, context: &mut Context) -> Role {
     context.persistent_state.log.push(LogPost { term: context.persistent_state.current_term, value });
-    broadcast_append_entries(
-        &context.persistent_state.current_term, 
-        &prev_log_index, 
-        &prev_log_term,
-        &vec!(LogPost { term: context.persistent_state.current_term, value }),
-        &context.volatile_state.commit_index, 
-        peers, 
-        outbound_channel);
+    leader.idle_timeout = Instant::now();
+    Role::Leader(leader)
 }
 
 fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &String, outbound_channel: &mpsc::Sender<DataMessage>, config: &TimeoutConfig, context: &mut Context) -> Role {
@@ -1115,7 +1125,7 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
             }
         },
         RaftMessage::AppendEntriesResponse(data) => {
-            println!("L {}: AppendEntriesResponse from {} with term {}", context.persistent_state.current_term, peer, data.term);
+            println!("L {}: AppendEntriesResponse from {} with term {} and result {}", context.persistent_state.current_term, peer, data.term, data.success);
             if data.term > context.persistent_state.current_term {
                 context.persistent_state.current_term = data.term;
                 context.persistent_state.voted_for = None;
@@ -1124,10 +1134,27 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
                 //////////////////////////////////////////////////////////////////////////////////
                 // Rule: Leader 3 part 2
                 if data.success {
-                    leader.next_index.insert(peer.clone(), data.last_log_index.unwrap() + 1);
+                    if let Some(index) = data.last_log_index {
+                        leader.next_index.insert(peer.clone(), index + 1);
+                    }
                     leader.match_index.insert(peer.clone(), data.last_log_index);
-                } else if *leader.next_index.get(peer).unwrap() > 0 {
-                    leader.next_index.insert(peer.clone(), leader.next_index.get(peer).unwrap() - 1);
+                } else {
+                    if let Some(next_index) = leader.next_index.get(peer) {
+                        if *next_index > 0 {
+                            let new_next_index = next_index - 1;
+                            leader.next_index.insert(peer.clone(), new_next_index);
+                            if new_next_index > 0 {
+                                send_append_entries(&context.persistent_state.current_term, &Some(new_next_index - 1), &Some(context.persistent_state.log.get(new_next_index - 1).unwrap().term), &context.persistent_state.log.get(new_next_index..).unwrap().iter().cloned().collect(), &context.volatile_state.commit_index, peer, outbound_channel);
+                            } else {
+                                send_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer, outbound_channel);
+                            }
+                        } else {
+                            leader.next_index.remove(peer);
+                            send_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer, outbound_channel);
+                        }
+                    } else {
+                        panic!("We should not fail here, there is no prior data");
+                    }
                 }
                 //////////////////////////////////////////////////////////////////////////////////
 
@@ -1195,7 +1222,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_append_entries_from_short() {
+    fn when_append_entries_from_given_empty_log_then_append_all() {
+        let mut a = Vec::new();
+        let b = vec!(LogPost { term: 0, value: 0 });
+
+        let expected = vec!(LogPost { term: 0, value: 0 });
+
+        append_entries_from(&mut a, &b, &None);
+
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn when_append_entries_from_given_heartbeat_then_do_nothing() {
+        let mut a = vec!(LogPost { term: 0, value: 0 });
+        let b = Vec::new();
+
+        let expected = vec!(LogPost { term: 0, value: 0 });
+
+        append_entries_from(&mut a, &b, &None);
+
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn when_append_entries_from_given_new_log_post_then_append() {
         let mut a = vec!(LogPost { term: 0, value: 0 });
         let b = vec!(LogPost { term: 1, value: 2 });
 
@@ -1207,23 +1258,11 @@ mod tests {
     }
 
     #[test]
-    fn test_append_entries_from_long() {
-        let mut a = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 });
-        let b = vec!(LogPost { term: 0, value: 2 }, LogPost { term: 0, value: 3 });
+    fn when_append_entries_from_given_conflicting_posts_then_replace() {
+        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 });
+        let b = vec!(LogPost { term: 1, value: 2});
 
-        let expected = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 }, LogPost { term: 0, value: 2 }, LogPost { term: 0, value: 3 });
-
-        append_entries_from(&mut a, &b, &Some(1));
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn test_append_entries_from_overwriting() {
-        let mut a = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 }, LogPost { term: 0, value: 7 }, LogPost { term: 0, value: 8 });
-        let b = vec!(LogPost { term: 0, value: 2 }, LogPost { term: 0, value: 3 });
-
-        let expected = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 2 }, LogPost { term: 0, value: 3 });
+        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 1, value: 2 });
 
         append_entries_from(&mut a, &b, &Some(0));
 
@@ -1231,11 +1270,11 @@ mod tests {
     }
 
     #[test]
-    fn test_append_entries_from_overlapping() {
-        let mut a = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 });
-        let b = vec!(LogPost { term: 0, value: 1 }, LogPost { term: 0, value: 2 });
+    fn when_append_entries_from_given_partly_overlapping_posts_then_append_new_posts() {
+        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 });
+        let b = vec!(LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
 
-        let expected = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 }, LogPost { term: 0, value: 2 });
+        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
 
         append_entries_from(&mut a, &b, &Some(0));
 
@@ -1243,13 +1282,25 @@ mod tests {
     }
 
     #[test]
-    fn test_append_entries_from_nothing_new() {
-        let mut a = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 });
-        let b = vec!(LogPost { term: 0, value: 1 });
+    fn when_append_entries_from_given_completely_overlapping_posts_then_do_nothing() {
+        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 }, LogPost { term: 1, value: 2 });
+        let b = vec!(LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
 
-        let expected = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 0, value: 1 });
+        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
 
         append_entries_from(&mut a, &b, &Some(0));
+
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn when_append_entries_from_given_new_leader_heartbeat_then_do_nothing() {
+        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 }, LogPost { term: 1, value: 2 });
+        let b = Vec::new();
+
+        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
+
+        append_entries_from(&mut a, &b, &None);
 
         assert_eq!(a, expected);
     }
@@ -1571,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn when_message_follower_given_append_entries_election_then_timeout_is_reset() {
+    fn when_message_follower_given_append_entries_then_election_timeout_is_reset() {
         let mut context = create_context();
 
         let config = create_config();
