@@ -180,7 +180,14 @@ fn main() {
         }
     }
 
-    let config : Config = confy::load("rusty_raft").unwrap();
+    let config : Config = match confy::load("rusty_raft") {
+        Ok(config) => config,
+        Err(_) => {
+            println!("Could not find configuration file, without peers we get no further.");
+            usage();
+            panic!("Aborting!");
+        }
+    };
 
     let timeout_config = TimeoutConfig {
         election_timeout_length: config.election_timeout_length,
@@ -194,7 +201,14 @@ fn main() {
         panic!("Aborting!");
     }
 
-    let local_address = peers.remove(&name).unwrap();
+    let local_address = match peers.remove(&name) {
+        Some(address) => address,
+        None => {
+            println!("Could not find the address of the node name.");
+            usage();
+            panic!("Aborting!");
+        }
+    };
     let peer_names : Vec<String> = peers.iter().map(|(peer_name, _)| peer_name.clone()).collect();
 
     println!("Starting {}", name);
@@ -212,11 +226,27 @@ fn main() {
     let stdin = io::stdin();
     loop {
         let mut buffer = String::new();
-        stdin.read_line(&mut buffer).unwrap();
+        match stdin.read_line(&mut buffer) {
+            Ok(_) => {},
+            Err(message) =>  {
+                println!("Encountered error: {}", message);
+                usage();
+                println!("Exiting!");
+                break;
+            }
+        };
         if buffer.trim().len() > 0 {
             match buffer.trim().parse::<i32>() {
                 Ok(value) => {
-                    log_channel.send(LogMessage { value }).unwrap();
+                    match log_channel.send(LogMessage { value }) {
+                        Ok(_) => {},
+                        Err(message) => {
+                            println!("Encountered error: {}", message);
+                            usage();
+                            println!("Exiting!");
+                            break;
+                        }
+                    };
                 },
                 Err(_) => {
                     println!("Invalid log value: {}", buffer);
@@ -230,11 +260,31 @@ fn main() {
 
     println!("Initiating exit.");
 
-    udp_system_channel.send(SystemMessage::Close).unwrap();
-    loop_system_channel.send(SystemMessage::Close).unwrap();
+    match udp_system_channel.send(SystemMessage::Close) {
+        Ok(_) => {},
+        Err(message) => {
+            println!("Failed to send close-message to the udp-channel: {}", message);
+        }
+    };
+    match loop_system_channel.send(SystemMessage::Close) {
+        Ok(_) => {},
+        Err(message) => {
+            println!("Failed to send close-message to the loop-channel: {}", message);
+        }
+    };
 
-    upd_handle.join().unwrap();
-    loop_handle.join().unwrap();
+    match upd_handle.join() {
+        Ok(_) => {},
+        Err(message) => {
+            println!("Failed to join the udp-channel: {:?}", message);
+        }
+    };
+    match loop_handle.join() {
+        Ok(_) => {},
+        Err(message) => {
+            println!("Failed to join the loop-channel: {:?}", message);
+        }
+    };
 
     println!("Node exiting!");
 }
@@ -251,7 +301,13 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
 
     let mut socket = UdpSocket::bind(&local_address);
     if let Ok(s) = &mut socket {
-        s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        match s.set_read_timeout(Some(Duration::from_millis(10))) {
+            Ok(_) => {},
+            Err(message) => {
+                println!("Failed to set read timeout from socket: {}.", message);
+                return
+            }
+        };
     }
 
     let mut random = rand::thread_rng();
@@ -274,8 +330,27 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                         println!("Dropped outgoing package!");
                         transfers_to_miss = random.gen_range(1..20);
                     } else {
-                        let message = serde_json::to_string(&msg.raft_message).unwrap();
-                        sock.send_to(message.as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
+                        let message = match serde_json::to_string(&msg.raft_message) {
+                            Ok(message) => message,
+                            Err(message) => {
+                                println!("Failed to parse message: {}", message);
+                                break
+                            }
+                        };
+                        let peer_address = match peers.get(&msg.peer) {
+                            Some(address) => address,
+                            None => {
+                                println!("Could not find address of peer: {}", msg.peer);
+                                break
+                            }
+                        };
+                        match sock.send_to(message.as_bytes(), peer_address) {
+                            Ok(_) => {},
+                            Err(message) => {
+                                println!("Failed to send message to peer: {}", message);
+                                break;
+                            }
+                        };
                     }
                 }
 
@@ -289,10 +364,39 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                             println!("Dropped incoming package!");
                             transfers_to_miss = random.gen_range(1..20);
                         } else {
-                            inbound_channel.send(DataMessage { 
-                                raft_message: serde_json::from_str(&str::from_utf8(&buf).unwrap().trim_matches(char::from(0))).unwrap(),
-                                peer: (*value_lookup.get(&source_address.to_string()).unwrap()).clone()
-                            }).unwrap();
+                            let message_text = match str::from_utf8(&buf) {
+                                Ok(text) => text,
+                                Err(message) => {
+                                    println!("Failed to parse incoming message: {}", message);
+                                    break;
+                                }
+                            };
+                            let message_text = message_text.trim_matches(char::from(0));
+                            let raft_message = match serde_json::from_str(message_text) {
+                                Ok(message) => message,
+                                Err(message) => {
+                                    println!("Failed to interpret incoming message: {}", message);
+                                    break;
+                                }
+                            };
+                            let peer_address = source_address.to_string();
+                            let peer = match value_lookup.get(&peer_address) {
+                                Some(peer) => peer,
+                                None => {
+                                    println!("Failed to find name of sender of incoming message: {}", peer_address);
+                                    break;
+                                }
+                            };
+                            match inbound_channel.send(DataMessage { 
+                                raft_message: raft_message,
+                                peer: (*peer).clone()
+                            }) {
+                                Ok(_) => {},
+                                Err(message) => {
+                                    println!("Failed to pass incoming message onto channel: {}", message);
+                                    break;
+                                }
+                            };
                         }
                     }
                 }
@@ -302,7 +406,13 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                 thread::sleep(Duration::from_millis(1000));
                 socket = UdpSocket::bind(&local_address);
                 if let Ok(s) = &mut socket {
-                    s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+                    match s.set_read_timeout(Some(Duration::from_millis(10))) {
+                        Ok(_) => {},
+                        Err(message) => {
+                            println!("Failed to set read timeout from socket: {}.", message);
+                            return
+                        }
+                    };
                 }
             }
         }
@@ -343,6 +453,7 @@ fn get_message_term(message: &RaftMessage) -> u64 {
     }
 }
 
+// Append entries to the log starting at start_pos, skipping duplicates and dropping all leftover entries in the log
 fn append_entries_from(log: &mut Vec<LogPost>, entries: &Vec<LogPost>, start_pos: &Option<usize>) {
     if entries.len() == 0 {
         return
@@ -351,20 +462,24 @@ fn append_entries_from(log: &mut Vec<LogPost>, entries: &Vec<LogPost>, start_pos
         return
     }
     let mut pos_offset = 0;
-    let start_pos = start_pos.or(Some(0)).unwrap();
+    let start_pos : usize = start_pos.unwrap_or_default();
     loop {
-        if pos_offset >= entries.len() {
-            log.drain((start_pos + pos_offset + 1)..);
-            break;
-        } else if log.len() == pos_offset + start_pos + 1 {
-            log.extend(entries.get(pos_offset..).unwrap().iter().cloned());
-            break;
-        } else if log.get(start_pos + pos_offset + 1).unwrap() == entries.get(pos_offset).unwrap() {
-            pos_offset += 1;
+        if let Some(new_entry) = entries.get(pos_offset) {
+            if let Some(old_entry) = log.get(start_pos + pos_offset + 1) {
+                if new_entry == old_entry {
+                    pos_offset += 1
+                } else {
+                    log.drain((start_pos + pos_offset + 1)..);
+                    log.extend(entries[pos_offset..].iter().cloned());
+                    break
+                }
+            } else {
+                log.extend(entries[pos_offset..].iter().cloned());
+                break
+            }
         } else {
             log.drain((start_pos + pos_offset + 1)..);
-            log.extend(entries.get(pos_offset..).unwrap().iter().cloned());
-            break;
+            break
         }
     }
 }
@@ -382,12 +497,14 @@ fn handle_append_entries(append_entries: &AppendEntriesData, context: &mut Conte
     // Receiver rule 2:
     if let Some(prev_index) = append_entries.prev_log_index {
         if let Some(prev_term) = append_entries.prev_log_term {
-            if context.persistent_state.log.len() < prev_index + 1 {
+            if let Some(post) = context.persistent_state.log.get(prev_index) {
+                if post.term != prev_term {
+                    // Log contains an entry at leader's previous index but its term is not the same as that of the leader
+                    send_append_entries_response(&context.persistent_state.current_term, &false, &None, peer, outbound_channel);
+                    return false
+                }
+            } else {
                 // Log does not contain an entry at leader's previous index
-                send_append_entries_response(&context.persistent_state.current_term, &false, &None, peer, outbound_channel);
-                return false
-            } else if context.persistent_state.log.get(prev_index).unwrap().term != prev_term {
-                // Log contains an entry at leader's previous index but its term is not the same as that of the leader
                 send_append_entries_response(&context.persistent_state.current_term, &false, &None, peer, outbound_channel);
                 return false
             }
@@ -549,7 +666,12 @@ fn tick_leader(leader: LeaderData,
                     let mut prev_log_term = None;
                     if *next_index > 0 {
                         prev_log_index = Some(next_index - 1);
-                        prev_log_term = Some(context.persistent_state.log.get(*next_index - 1).unwrap().term);
+                        prev_log_term = match context.persistent_state.log.get(*next_index - 1) {
+                            Some(post) => Some(post.term),
+                            None => {
+                                panic!("Failed to find log entry term of {}", *next_index - 1);
+                            }
+                        };
                     }
                     send_append_entries(&context.persistent_state.current_term, &prev_log_index, &prev_log_term, &get_log_range(&Some(*next_index), &context.persistent_state.log), &context.volatile_state.commit_index, peer, outbound_channel)
                 }
@@ -614,25 +736,32 @@ fn get_log_range(from_index: &Option<usize>, log: &Vec<LogPost>) -> Vec<LogPost>
 
 fn check_last_log_post(last_log_index: &Option<usize>, last_log_term: &Option<u64>, log: &Vec<LogPost>) -> bool {
     if log.len() == 0 {
-        if last_log_index.is_some() {
-            false
-        } else if last_log_term.is_some() {
-            false
-        } else {
-            true
-        }
-    } else if last_log_index.is_none() {
-        false
-    } else if last_log_term.is_none() {
-        false
-    } else if log.len() - 1 > last_log_index.unwrap() {
-        false
-    } else if log.len() - 1 < last_log_index.unwrap() {
-        true
-    } else if log.get(last_log_index.unwrap()).unwrap().term != last_log_term.unwrap() {
-        false
+        last_log_index.is_none() && last_log_term.is_none()
     } else {
-        true
+        match last_log_index {
+            None => false,
+            Some(index) => {
+                match last_log_term {
+                    None => false,
+                    Some(term) => {
+                        if log.len() - 1 > *index {
+                            false
+                        } else if log.len() - 1 < *index {
+                            true
+                        } else {
+                            match log.get(*index) {
+                                Some(post) => {
+                                    post.term == *term
+                                },
+                                None => {
+                                    panic!("We are sure there is a post at index");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -728,28 +857,38 @@ fn broadcast_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log
 }
 
 fn send_request_vote(term: &u64, last_log_index: &Option<usize>, last_log_term: &Option<u64>, peer: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { 
+    match outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::RequestVote(RequestVoteData{ 
             term: *term,
             last_log_index: *last_log_index,
             last_log_term: *last_log_term
         }), 
         peer: (*peer).clone()
-    }).unwrap();
+    }) {
+        Ok(_) => {},
+        Err(message) => {
+            panic!("Failed to send request vote: {}", message);
+        }
+    };
 }
 
 fn send_request_vote_response(term: &u64, vote_granted: bool, candidate: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { 
+    match outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
             term: *term,
             vote_granted: vote_granted
         }), 
         peer: (*candidate).clone()
-    }).unwrap();
+    }) {
+        Ok(_) => {},
+        Err(message) => {
+            panic!("Failed to send request vote response: {}", message);
+        }
+    }
 }
 
 fn send_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log_term: &Option<u64>, entries: &Vec<LogPost>, leader_commit: &Option<usize>, follower: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { 
+    match outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::AppendEntries(AppendEntriesData {
             term: *term,
             prev_log_index: *prev_log_index,
@@ -758,18 +897,28 @@ fn send_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log_term
             leader_commit: *leader_commit
         }),
         peer: (*follower).clone()
-    }).unwrap();
+    }) {
+        Ok(_) => {},
+        Err(message) => {
+            panic!("Failed to send append entries: {}", message);
+        }
+    };
 }
 
 fn send_append_entries_response(term: &u64, success: &bool, last_log_index: &Option<usize>, leader: &String, outbound_channel: &mpsc::Sender<DataMessage>) {
-    outbound_channel.send(DataMessage { 
+    match outbound_channel.send(DataMessage { 
         raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
             term: *term,
             success: *success,
             last_log_index: *last_log_index
         }), 
         peer: (*leader).clone()
-    }).unwrap();
+    }) {
+        Ok(_) => {},
+        Err(message) => {
+            panic!("Faield to send append entries response: {}", message);
+        }
+    };
 }
 
 fn tick(role: Role, 
@@ -787,12 +936,20 @@ fn tick(role: Role,
     if let Some(commit_index) = context.volatile_state.commit_index {
         if let Some(last_applied) = context.volatile_state.last_applied {
             if commit_index > last_applied {
-                context.volatile_state.last_applied = Some(last_applied + 1);
-                apply_log_post(context.persistent_state.log.get(last_applied).unwrap());
+                if let Some(post) = context.persistent_state.log.get(last_applied) {
+                    context.volatile_state.last_applied = Some(last_applied + 1);
+                    apply_log_post(post);
+                } else {
+                    panic!("We know that last applied must exist!");
+                }
             }
         } else {
-            context.volatile_state.last_applied = Some(0);
-            apply_log_post(context.persistent_state.log.get(0).unwrap());
+            if let Some(post) = context.persistent_state.log.get(0) {
+                context.volatile_state.last_applied = Some(0);
+                apply_log_post(post);
+            } else {
+                panic!("Since commit_index has a value there must be something in the log.");
+            }
         }
     }
     //////////////////////////////////////////////////////////////////////////////////////////////
@@ -975,7 +1132,11 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
                             let new_next_index = next_index - 1;
                             leader.next_index.insert(peer.clone(), new_next_index);
                             if new_next_index > 0 {
-                                send_append_entries(&context.persistent_state.current_term, &Some(new_next_index - 1), &Some(context.persistent_state.log.get(new_next_index - 1).unwrap().term), &context.persistent_state.log.get(new_next_index..).unwrap().iter().cloned().collect(), &context.volatile_state.commit_index, peer, outbound_channel);
+                                if let Some(post) = context.persistent_state.log.get(new_next_index - 1) {
+                                    send_append_entries(&context.persistent_state.current_term, &Some(new_next_index - 1), &Some(post.term), &context.persistent_state.log[new_next_index..].iter().cloned().collect(), &context.volatile_state.commit_index, peer, outbound_channel);
+                                } else {
+                                    panic!("Since new_next_index is at least zero there must be something in the log.");
+                                }
                             } else {
                                 send_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer, outbound_channel);
                             }
