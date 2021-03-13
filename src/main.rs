@@ -1,7 +1,6 @@
 use rand::Rng;
 use std::collections::HashMap;
 use std::cmp;
-use std::convert::TryFrom;
 use std::env;
 use std::fmt;
 use std::io;
@@ -13,8 +12,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use serde::Deserialize;
-use serde_json::json;
-use serde_json::Value;
 use serde::Serialize;
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +41,7 @@ enum SystemMessage {
     Close
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 enum RaftMessage {
     AppendEntries(AppendEntriesData),
     AppendEntriesResponse(AppendEntriesResponseData),
@@ -51,7 +49,7 @@ enum RaftMessage {
     RequestVoteResponse(RequestVoteResponseData)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct AppendEntriesData {
     term: u64,
     prev_log_index: Option<usize>,
@@ -60,18 +58,21 @@ struct AppendEntriesData {
     leader_commit: Option<usize>
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct AppendEntriesResponseData {
     term: u64,
     success: bool,
     last_log_index: Option<usize>
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct RequestVoteData {
     term: u64,
     last_log_index: Option<usize>,
     last_log_term: Option<u64>
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct RequestVoteResponseData {
     term: u64,
     vote_granted: bool
@@ -110,7 +111,7 @@ struct Context {
     volatile_state: VolatileState
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct LogPost {
     term: u64,
     value: i32
@@ -142,6 +143,7 @@ struct VolatileState {
     last_applied: Option<usize>
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 struct DataMessage {
     raft_message: RaftMessage,
     peer: String
@@ -272,7 +274,8 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                         println!("Dropped outgoing package!");
                         transfers_to_miss = random.gen_range(1..20);
                     } else {
-                        sock.send_to(serialize(&msg.raft_message).as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
+                        let message = serde_json::to_string(&msg.raft_message).unwrap();
+                        sock.send_to(message.as_bytes(), peers.get(&msg.peer).unwrap()).unwrap();
                     }
                 }
 
@@ -287,7 +290,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                             transfers_to_miss = random.gen_range(1..20);
                         } else {
                             inbound_channel.send(DataMessage { 
-                                raft_message: parse(str::from_utf8(&buf).unwrap().trim_matches(char::from(0))), 
+                                raft_message: serde_json::from_str(&str::from_utf8(&buf).unwrap().trim_matches(char::from(0))).unwrap(),
                                 peer: (*value_lookup.get(&source_address.to_string()).unwrap()).clone()
                             }).unwrap();
                         }
@@ -302,178 +305,6 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                     s.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
                 }
             }
-        }
-    }
-}
-
-fn parse(message : &str) -> RaftMessage {
-    let msg = serde_json::from_str(message).unwrap();
-    match msg {
-        Value::Object(map) => {
-            if let Some(candidate) = map.get("request_vote") {
-                RaftMessage::RequestVote(RequestVoteData {
-                    term: parse_u64(candidate.get("term").unwrap()),
-                    last_log_index: parse_option_usize(candidate.get("last_log_index").unwrap()),
-                    last_log_term: parse_option_u64(candidate.get("last_log_term").unwrap())
-                })
-            } else if let Some(request_vote_response) = map.get("request_vote_response") {
-                RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
-                    term: parse_u64(request_vote_response.get("term").unwrap()),
-                    vote_granted: request_vote_response.get("vote_granted").unwrap() == "true"
-                })
-            } else if let Some(append_entries) = map.get("append_entries") {
-                RaftMessage::AppendEntries(AppendEntriesData {
-                    term: parse_u64(append_entries.get("term").unwrap()),
-                    prev_log_index: parse_option_usize(append_entries.get("prev_log_index").unwrap()),
-                    prev_log_term: parse_option_u64(append_entries.get("prev_log_term").unwrap()),
-                    entries: parse_entries(append_entries.get("entries").unwrap()),
-                    leader_commit: parse_option_usize(append_entries.get("leader_commit").unwrap())
-                })
-            } else if let Some(append_entries_response) = map.get("append_entries_response") {
-                RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
-                    term: parse_u64(append_entries_response.get("term").unwrap()),
-                    success: append_entries_response.get("success").unwrap() == "true",
-                    last_log_index: parse_option_usize(append_entries_response.get("last_log_index").unwrap())
-                })
-            } else {
-                panic!("Not handled {}", message);
-            }
-        },
-        _ => {  
-            panic!("Invalid json!");
-        }
-    }
-}
-
-fn parse_entry(value: &serde_json::Value) -> LogPost {
-    match value {
-        serde_json::Value::Object(map) => {
-            LogPost {
-                term: parse_u64(map.get("term").unwrap()),
-                value: parse_i32(map.get("value").unwrap())
-            }
-        },
-        _ => {
-            panic!("Not a valid entry");
-        }
-    }
-}
-
-fn parse_entries(value: &serde_json::Value) -> Vec<LogPost> {
-    match value {
-        serde_json::Value::Array(array) => {
-            array.iter().map(|value| parse_entry(value)).collect()
-        },
-        _ => {
-            panic!("Not a valid entry list");
-        }
-    }
-}
-
-
-fn parse_option_u64(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Number(_) => Some(parse_u64(value)),
-        serde_json::Value::Null => None,
-        _ => {
-            panic!("Unknown value");
-        }
-    }
-}
-
-fn parse_u64(value: &serde_json::Value) -> u64 {
-    match value {
-        serde_json::Value::Number(i) => {
-            i.as_u64().unwrap()
-        },
-        _ => {
-            panic!("Not a u64");
-        }
-    }
-}
-
-fn parse_i32(value: &serde_json::Value) -> i32 {
-    match value {
-        serde_json::Value::Number(i) => {
-            i32::try_from(i.as_u64().unwrap()).unwrap()
-        },
-        _ => {
-            panic!("Not an i32");
-        }
-    }
-}
-
-fn parse_option_usize(value: &serde_json::Value) -> Option<usize> {
-    match value {
-        serde_json::Value::Number(_) => Some(parse_usize(value)),
-        serde_json::Value::Null => None,
-        _ => {
-            panic!("Unknown value");
-        }
-    }
-}
-
-fn parse_usize(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Number(i) => {
-            usize::try_from(i.as_u64().unwrap()).unwrap()
-        },
-        _ => {
-            panic!("Not a usize");
-        }
-    }
-}
-
-fn serialize(message : &RaftMessage) -> String {
-    match message {
-        RaftMessage::AppendEntries(data) => {
-            json!({
-                "append_entries": json!({
-                    "term": data.term,
-                    "prev_log_index": data.prev_log_index,
-                    "prev_log_term": match data.prev_log_term {
-                        Some(term) => json!(term),
-                        None => serde_json::Value::Null,
-                    },
-                    "entries": data.entries.iter().map(|entry| json!({ "term": entry.term, "value": entry.value })).collect::<serde_json::Value>(),
-                    "leader_commit": data.leader_commit
-                }) 
-            }).to_string()
-        },
-        RaftMessage::AppendEntriesResponse(data) => {
-            json!({
-                "append_entries_response": json!({
-                    "term": data.term,
-                    "success": if data.success { "true" } else { "false" },
-                    "last_log_index": match data.last_log_index {
-                        Some(index) => json!(index),
-                        None => serde_json::Value::Null
-                    }
-                })
-            }).to_string()
-        },
-        RaftMessage::RequestVote(data) => {
-            json!({ 
-                "request_vote": json!({
-                    "term": data.term,
-                    "last_log_index": match data.last_log_index {
-                        Some(index) => json!(index),
-                        None => serde_json::Value::Null
-                    },
-                    "last_log_term": match data.last_log_term {
-                        Some(term) => json!(term),
-                        None => serde_json::Value::Null
-                    }
-                })
-            }).to_string()
-        },
-        RaftMessage::RequestVoteResponse(data) => {
-            json!({
-                "request_vote_response": json!({
-                    "term": data.term,
-                    "vote_granted": if data.vote_granted { "true" } else { "false" }
-                })
-            }).to_string()
         }
     }
 }
