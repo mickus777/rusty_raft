@@ -1,7 +1,6 @@
 use rand::Rng;
 use std::collections::HashMap;
 use std::cmp;
-use std::env;
 use std::fmt;
 use std::io;
 use std::net::UdpSocket;
@@ -11,6 +10,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use args::Args;
+use getopts::Occur;
 use log::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -159,34 +160,40 @@ fn usage() {
     println!("     NAME is the name of this server.");
 }
 
+fn parse_arguments() -> Args {
+    let mut args = Args::new("rusty-raft", "A simple implementation of the Rust algorithm.");
+    args.flag("s", "simulated-bad-connection", "Simulates a bad connection by dropping packages.");
+    args.option("n", "name", "The name of this server.", "NAME", Occur::Req, None);
+    args.option("v", "verbosity", "Indicates log level, higher shows more", "VERBOSITY", Occur::Optional, Some(String::from("2")));
+
+    if let Result::Err(message) = args.parse_from_cli() {
+        println!("Failed to parse arguments: {}", message);
+        println!("{}", args.full_usage());
+        panic!("Exiting!");
+    }
+
+    args
+}
+
 fn main() {
-    let mut arguments = env::args();
+    let args = parse_arguments();
 
     if let Result::Err(message) = stderrlog::new()
         .timestamp(stderrlog::Timestamp::Second)
-        .verbosity(3)
+        .verbosity(args.value_of("verbosity").unwrap())
         .init() {
             panic!("Failed to initialize log: {}!", message);
     };
 
-    // Pop the command
-    arguments.next();
-
-    let name = match arguments.next() {
-        Some(arg) => arg,
-        None => {
-            println!("Invalid name-parameter.");
-            usage();
-            panic!("Aborting");
-        }
+    let name = if let Result::Ok(n) = args.value_of("name") {
+        n
+    } else {
+        error!("No valid name given.");
+        args.full_usage();
+        panic!("Exiting!");
     };
 
-    let mut bad_connection = false;
-    if let Some(arg) = arguments.next() {
-        if arg == "--simulate-bad-connection" || arg == "-s" {
-            bad_connection = true;
-        }
-    }
+    let bad_connection = args.value_of::<bool>("simulated-bad-connection").is_ok();
 
     let config : Config = match confy::load("rusty_raft") {
         Ok(config) => config,
