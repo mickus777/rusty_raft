@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use log::*;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -161,6 +162,13 @@ fn usage() {
 fn main() {
     let mut arguments = env::args();
 
+    if let Result::Err(message) = stderrlog::new()
+        .timestamp(stderrlog::Timestamp::Second)
+        .verbosity(3)
+        .init() {
+            panic!("Failed to initialize log: {}!", message);
+    };
+
     // Pop the command
     arguments.next();
 
@@ -211,7 +219,7 @@ fn main() {
     };
     let peer_names : Vec<String> = peers.iter().map(|(peer_name, _)| peer_name.clone()).collect();
 
-    println!("Starting {}", name);
+    info!("Starting {}", name);
 
     let (inbound_channel_entrance, inbound_channel_exit) = mpsc::channel();
     let (outbound_channel_entrance, outbound_channel_exit) = mpsc::channel();
@@ -229,9 +237,9 @@ fn main() {
         match stdin.read_line(&mut buffer) {
             Ok(_) => {},
             Err(message) =>  {
-                println!("Encountered error: {}", message);
+                error!("Encountered error: {}", message);
                 usage();
-                println!("Exiting!");
+                info!("Exiting!");
                 break;
             }
         };
@@ -241,15 +249,16 @@ fn main() {
                     match log_channel.send(LogMessage { value }) {
                         Ok(_) => {},
                         Err(message) => {
-                            println!("Encountered error: {}", message);
+                            error!("Encountered error: {}", message);
                             usage();
-                            println!("Exiting!");
+                            info!("Exiting!");
                             break;
                         }
                     };
                 },
                 Err(_) => {
-                    println!("Invalid log value: {}", buffer);
+                    error!("Invalid log value: {}", buffer);
+                    info!("Exiting!");
                     break;
                 }
             }
@@ -258,35 +267,35 @@ fn main() {
         }
     }
 
-    println!("Initiating exit.");
+    info!("Initiating exit.");
 
     match udp_system_channel.send(SystemMessage::Close) {
         Ok(_) => {},
         Err(message) => {
-            println!("Failed to send close-message to the udp-channel: {}", message);
+            error!("Failed to send close-message to the udp-channel: {}", message);
         }
     };
     match loop_system_channel.send(SystemMessage::Close) {
         Ok(_) => {},
         Err(message) => {
-            println!("Failed to send close-message to the loop-channel: {}", message);
+            error!("Failed to send close-message to the loop-channel: {}", message);
         }
     };
 
     match upd_handle.join() {
         Ok(_) => {},
         Err(message) => {
-            println!("Failed to join the udp-channel: {:?}", message);
+            error!("Failed to join the udp-channel: {:?}", message);
         }
     };
     match loop_handle.join() {
         Ok(_) => {},
         Err(message) => {
-            println!("Failed to join the loop-channel: {:?}", message);
+            error!("Failed to join the loop-channel: {:?}", message);
         }
     };
 
-    println!("Node exiting!");
+    info!("Node exiting!");
 }
 
 fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, 
@@ -297,14 +306,14 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
     bad_connection: bool) {
 
     let value_lookup = peers.iter().map(|(key, value)| (value, key)).collect::<HashMap<&String, &String>>();
-    println!("{}", local_address);
+    debug!("Local udp-address: {}", local_address);
 
     let mut socket = UdpSocket::bind(&local_address);
     if let Ok(s) = &mut socket {
         match s.set_read_timeout(Some(Duration::from_millis(10))) {
             Ok(_) => {},
             Err(message) => {
-                println!("Failed to set read timeout from socket: {}.", message);
+                error!("Failed to set read timeout from socket: {}.", message);
                 return
             }
         };
@@ -316,7 +325,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
 
     loop {
         if let Ok(SystemMessage::Close) = system_channel.try_recv() {
-            println!("UDP Connection exiting!");
+            info!("UDP Connection exiting!");
             break;
         }
 
@@ -324,30 +333,30 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
             Result::Ok(sock) => {
                 if let Ok(msg) = outbound_channel.try_recv() {
                     if bad_connection && transfers_to_miss > 0 {
-                        println!("Dropped outgoing package!");
+                        debug!("Dropped outgoing package!");
                         transfers_to_miss -= 1;
                     } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                        println!("Dropped outgoing package!");
+                        debug!("Dropped outgoing package!");
                         transfers_to_miss = random.gen_range(1..20);
                     } else {
                         let message = match serde_json::to_string(&msg.raft_message) {
                             Ok(message) => message,
                             Err(message) => {
-                                println!("Failed to parse message: {}", message);
+                                error!("Failed to parse message: {}", message);
                                 break
                             }
                         };
                         let peer_address = match peers.get(&msg.peer) {
                             Some(address) => address,
                             None => {
-                                println!("Could not find address of peer: {}", msg.peer);
+                                error!("Could not find address of peer: {}", msg.peer);
                                 break
                             }
                         };
                         match sock.send_to(message.as_bytes(), peer_address) {
                             Ok(_) => {},
                             Err(message) => {
-                                println!("Failed to send message to peer: {}", message);
+                                error!("Failed to send message to peer: {}", message);
                                 break;
                             }
                         };
@@ -358,16 +367,16 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                 if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
                     if number_of_bytes > 0 {
                         if bad_connection && transfers_to_miss > 0 {
-                            println!("Dropped incoming package!");
+                            debug!("Dropped incoming package!");
                             transfers_to_miss -= 1;
                         } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                            println!("Dropped incoming package!");
+                            debug!("Dropped incoming package!");
                             transfers_to_miss = random.gen_range(1..20);
                         } else {
                             let message_text = match str::from_utf8(&buf) {
                                 Ok(text) => text,
                                 Err(message) => {
-                                    println!("Failed to parse incoming message: {}", message);
+                                    error!("Failed to parse incoming message: {}", message);
                                     break;
                                 }
                             };
@@ -375,7 +384,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                             let raft_message = match serde_json::from_str(message_text) {
                                 Ok(message) => message,
                                 Err(message) => {
-                                    println!("Failed to interpret incoming message: {}", message);
+                                    error!("Failed to interpret incoming message: {}", message);
                                     break;
                                 }
                             };
@@ -383,7 +392,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                             let peer = match value_lookup.get(&peer_address) {
                                 Some(peer) => peer,
                                 None => {
-                                    println!("Failed to find name of sender of incoming message: {}", peer_address);
+                                    error!("Failed to find name of sender of incoming message: {}", peer_address);
                                     break;
                                 }
                             };
@@ -393,7 +402,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                             }) {
                                 Ok(_) => {},
                                 Err(message) => {
-                                    println!("Failed to pass incoming message onto channel: {}", message);
+                                    error!("Failed to pass incoming message onto channel: {}", message);
                                     break;
                                 }
                             };
@@ -402,14 +411,14 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
                 }
             }
             Result::Err(msg) => {
-                println!("Failed to bind socket: {}", msg);
+                warn!("Failed to bind socket: {}", msg);
                 thread::sleep(Duration::from_millis(1000));
                 socket = UdpSocket::bind(&local_address);
                 if let Ok(s) = &mut socket {
                     match s.set_read_timeout(Some(Duration::from_millis(10))) {
                         Ok(_) => {},
                         Err(message) => {
-                            println!("Failed to set read timeout from socket: {}.", message);
+                            error!("Failed to set read timeout from socket: {}.", message);
                             return
                         }
                     };
@@ -502,12 +511,10 @@ fn handle_append_entries(role: Role, append_entries: &AppendEntriesData, config:
         if let Some(prev_term) = append_entries.prev_log_term {
             if let Some(post) = context.persistent_state.log.get(prev_index) {
                 if post.term != prev_term {
-                    println!("Test 1");
                     // Log contains an entry at leader's previous index but its term is not the same as that of the leader
                     return (role, create_append_entries_response(&context.persistent_state.current_term, &false, &None, peer))
                 }
             } else {
-                println!("Test 2");
                 // Log does not contain an entry at leader's previous index
                 return (role, create_append_entries_response(&context.persistent_state.current_term, &false, &None, peer))
             }
@@ -582,11 +589,11 @@ fn tick_follower(follower: FollowerData,
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Followers 2
     if follower.election_timeout.elapsed().as_millis() > follower.election_timeout_length {
-        println!("F {}: Timeout!", context.persistent_state.current_term);
+        debug!("F {}: Timeout!", context.persistent_state.current_term);
         become_candidate(peers, config, context)
     //////////////////////////////////////////////////////////////////////////////////////////////
     } else {
-        println!("F {}: Timeout in {}", context.persistent_state.current_term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
+        debug!("F {}: Timeout in {}", context.persistent_state.current_term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
         (Role::Follower(follower), Vec::new())
     }
 }
@@ -599,17 +606,17 @@ fn tick_candidate(candidate: CandidateData,
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Candidate 2
     if candidate.peers_approving.len() >= peers.len() / 2 {
-        println!("C {}: Elected!", context.persistent_state.current_term);
+        info!("C {}: Elected!", context.persistent_state.current_term);
         become_leader(peers, config, context)
     //////////////////////////////////////////////////////////////////////////////////////////////
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Candidate 4
     } else if candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
-        println!("C {}: Timeout!", context.persistent_state.current_term);
+        debug!("C {}: Timeout!", context.persistent_state.current_term);
         become_candidate(peers, config, context)
     //////////////////////////////////////////////////////////////////////////////////////////////
     } else {
-        println!("C {}: Timeout in {}", context.persistent_state.current_term, candidate.election_timeout_length - candidate.election_timeout.elapsed().as_millis());
+        debug!("C {}: Timeout in {}", context.persistent_state.current_term, candidate.election_timeout_length - candidate.election_timeout.elapsed().as_millis());
         (Role::Candidate(candidate), Vec::new())
     }
 }
@@ -631,9 +638,9 @@ fn tick_leader(mut leader: LeaderData,
             _ => Some(context.persistent_state.log.len() - 1)
         };
         if prev_log_term.is_some() {
-            println!("L {}: Broadcast AppendEntries Idle term: {}, index: {}", context.persistent_state.current_term, prev_log_term.unwrap(), prev_log_index.unwrap());
+            debug!("L {}: Broadcast AppendEntries Idle term: {}, index: {}", context.persistent_state.current_term, prev_log_term.unwrap(), prev_log_index.unwrap());
         } else {
-            println!("L {}: Broadcast AppendEntries Idle", context.persistent_state.current_term);
+            debug!("L {}: Broadcast AppendEntries Idle", context.persistent_state.current_term);
         }
         let messages = create_append_entrieses(
             &context.persistent_state.current_term, 
@@ -675,7 +682,7 @@ fn tick_leader(mut leader: LeaderData,
                             }
                         };
                     }
-                    println!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
+                    debug!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
                     messages.push(create_append_entries(
                         &context.persistent_state.current_term, 
                         &prev_log_index, 
@@ -800,7 +807,7 @@ fn become_candidate(peers: &Vec<String>, config: &TimeoutConfig, context: &mut C
         0 => None,
         _ => Some(context.persistent_state.log.len() - 1)
     };
-    println!("X {}: Broadcast request votes to: {:?}", context.persistent_state.current_term, peers);
+    debug!("X {}: Broadcast request votes to: {:?}", context.persistent_state.current_term, peers);
     (Role::Candidate(CandidateData {
         election_timeout: Instant::now(), 
         election_timeout_length: randomize_timeout(&config.election_timeout_length, &mut context.random), 
@@ -832,7 +839,7 @@ fn become_leader(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Cont
         0 => None,
         _ => Some(context.persistent_state.log.len())
     };
-    println!("X {}: Broadcast heartbeat to: {:?}", context.persistent_state.current_term, peers);
+    debug!("X {}: Broadcast heartbeat to: {:?}", context.persistent_state.current_term, peers);
     let messages = create_append_entrieses(
         &context.persistent_state.current_term, 
         &prev_log_index,
@@ -926,11 +933,11 @@ fn create_append_entries_response(term: &u64, success: &bool, last_log_index: &O
 fn receive_log(role: Role, message: LogMessage, context: &mut Context) -> (Role, Vec<DataMessage>) {
     match role {
         Role::Follower(_) => {
-            println!("Follower can not receive incoming data.");
+            warn!("Follower can not receive incoming data.");
             (role, Vec::new())
         },
         Role::Candidate(_) => {
-            println!("Candidate can not receive incoming data.");
+            warn!("Candidate can not receive incoming data.");
             (role, Vec::new())
         },
         Role::Leader(leader) => {
@@ -1025,11 +1032,11 @@ fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &S
         //////////////////////////////////////////////////////////////////////////////////////////
         // Rule: Followers 1
         RaftMessage::AppendEntries(data) => {
-            println!("F {}: Received AppendEntries from {} term: {}", context.persistent_state.current_term, peer, data.term);
+            debug!("F {}: Received AppendEntries from {} term: {}", context.persistent_state.current_term, peer, data.term);
             handle_append_entries(Role::Follower(follower), &data, config, context, &peer)
         },
         RaftMessage::RequestVote(data) => {
-            println!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, peer, data.term);
+            debug!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, peer, data.term);
             if handle_request_vote(&data, &peer, config, context) {
                 (become_follower(config, context), vec!(create_request_vote_response(&context.persistent_state.current_term, true, &peer)))
             } else {
@@ -1038,12 +1045,12 @@ fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &S
         },
         //////////////////////////////////////////////////////////////////////////////////////////
         RaftMessage::AppendEntriesResponse(data) => {
-            println!("F {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
+            debug!("F {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
             // Old or misguided message, ignore
             (Role::Follower(follower), Vec::new())
         },
         RaftMessage::RequestVoteResponse(data) => {
-            println!("F {}: Received RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
+            debug!("F {}: Received RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             // Old or misguided message, ignore
             (Role::Follower(follower), Vec::new())
         }
@@ -1053,24 +1060,24 @@ fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &S
 fn message_candidate(mut candidate: CandidateData, raft_message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
     match raft_message {
         RaftMessage::AppendEntries(data) => {
-            println!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, peer, data.term);
+            debug!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, peer, data.term);
             //////////////////////////////////////////////////////////////////////////////////////
             // Rule: Candidate 3
             handle_append_entries(Role::Candidate(candidate), &data, config, context, &peer)
             //////////////////////////////////////////////////////////////////////////////////////
         },
         RaftMessage::AppendEntriesResponse(data) => {
-            println!("C {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
+            debug!("C {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
             // Old or misguided message, ignore
             (Role::Candidate(candidate), Vec::new())
         },
         RaftMessage::RequestVote(data) => {
-            println!("C {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
+            debug!("C {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
             let result = handle_request_vote(&data, &peer, config, context);
             (Role::Candidate(candidate), vec!(create_request_vote_response(&context.persistent_state.current_term, result, &peer)))
         },
         RaftMessage::RequestVoteResponse(data) => {
-            println!("C {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
+            debug!("C {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             if data.term > context.persistent_state.current_term {
                 context.persistent_state.current_term = data.term;
                 context.persistent_state.voted_for = None;
@@ -1089,11 +1096,11 @@ fn message_candidate(mut candidate: CandidateData, raft_message: &RaftMessage, p
 fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
     match raft_message {
         RaftMessage::AppendEntries(data) => {
-            println!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, peer, data.term);
+            debug!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, peer, data.term);
             handle_append_entries(Role::Leader(leader), &data, config, context, &peer)
         },
         RaftMessage::AppendEntriesResponse(data) => {
-            println!("L {}: AppendEntriesResponse from {} with {} term {}", context.persistent_state.current_term, peer, data.success, data.term);
+            debug!("L {}: AppendEntriesResponse from {} with {} term {}", context.persistent_state.current_term, peer, data.success, data.term);
             if data.term > context.persistent_state.current_term {
                 context.persistent_state.current_term = data.term;
                 context.persistent_state.voted_for = None;
@@ -1135,12 +1142,12 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
             }
         },
         RaftMessage::RequestVote(data) => {
-            println!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
+            debug!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
             let result = handle_request_vote(&data, &peer, config, context);
             (Role::Leader(leader), vec!(create_request_vote_response(&context.persistent_state.current_term, result, &peer)))
         },
         RaftMessage::RequestVoteResponse(data) => {
-            println!("L {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
+            debug!("L {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             // Ignore for now
             (Role::Leader(leader), Vec::new())
         }
@@ -1180,11 +1187,11 @@ fn main_loop(name: String, system_channel: mpsc::Receiver<SystemMessage>,
 
     loop {
         if let Ok(_) = system_channel.try_recv() {
-            println!("Main loop exiting!");
+            info!("Main loop exiting!");
             break;
         }
 
-        println!("X: {:?}", context.persistent_state.log);
+        debug!("X: {:?}", context.persistent_state.log);
 
         let (new_role, outbound_messages) = if let Ok(message) = log_channel.try_recv() {
             receive_log(role, message, &mut context)
