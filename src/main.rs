@@ -155,11 +155,6 @@ struct LogMessage {
     value: i32
 }
 
-fn usage() {
-    println!("Usage: rusty-raft '[NAME]'");
-    println!("     NAME is the name of this server.");
-}
-
 fn parse_arguments() -> Args {
     let mut args = Args::new("rusty-raft", "A simple implementation of the Rust algorithm.");
     args.flag("s", "simulated-bad-connection", "Simulates a bad connection by dropping packages.");
@@ -193,13 +188,13 @@ fn main() {
         panic!("Exiting!");
     };
 
-    let bad_connection = args.value_of::<bool>("simulated-bad-connection").is_ok();
+    let bad_connection = if let Ok(bad) = args.value_of::<bool>("simulated-bad-connection") { bad } else { false };
 
     let config : Config = match confy::load("rusty_raft") {
         Ok(config) => config,
         Err(_) => {
             println!("Could not find configuration file, without peers we get no further.");
-            usage();
+            args.full_usage();
             panic!("Aborting!");
         }
     };
@@ -212,7 +207,7 @@ fn main() {
 
     if peers.len() < 3 {
         println!("Invalid list of peers. At least three are required.");
-        usage();
+        args.full_usage();
         panic!("Aborting!");
     }
 
@@ -220,7 +215,7 @@ fn main() {
         Some(address) => address,
         None => {
             println!("Could not find the address of the node name.");
-            usage();
+            args.full_usage();
             panic!("Aborting!");
         }
     };
@@ -245,7 +240,7 @@ fn main() {
             Ok(_) => {},
             Err(message) =>  {
                 error!("Encountered error: {}", message);
-                usage();
+                args.full_usage();
                 info!("Exiting!");
                 break;
             }
@@ -257,7 +252,7 @@ fn main() {
                         Ok(_) => {},
                         Err(message) => {
                             error!("Encountered error: {}", message);
-                            usage();
+                            args.full_usage();
                             info!("Exiting!");
                             break;
                         }
@@ -305,6 +300,83 @@ fn main() {
     info!("Node exiting!");
 }
 
+fn create_socket(address: &str) -> Result<std::net::UdpSocket, std::io::Error> {
+    let mut socket = UdpSocket::bind(address);
+
+    if let Ok(s) = &mut socket {
+        match s.set_read_timeout(Some(Duration::from_millis(10))) {
+            Ok(_) => {},
+            Err(message) => {
+                error!("Failed to set read timeout for socket: {}", message);
+            }
+        }
+    }
+
+    socket
+}
+
+fn send_outbound_message(message: DataMessage, peers: &HashMap<String, String>, socket: &UdpSocket) -> Result<(), String> {
+    let msg = match serde_json::to_string(&message.raft_message) {
+        Ok(msg) => msg,
+        Err(msg) => {
+            return Result::Err(format!("Failed to parse message: {}", msg));
+        }
+    };
+    let peer_address = match peers.get(&message.peer) {
+        Some(address) => address,
+        None => {
+            return Result::Err(format!("Could not find address of peer: {}", message.peer));
+        }
+    };
+    match socket.send_to(msg.as_bytes(), peer_address) {
+        Ok(_) => {
+            return Result::Ok(());
+        },
+        Err(m) => {
+            return Result::Err(format!("Failed to send message to peer: {}", m));
+        }
+    };
+}
+
+fn send_inbound_message(buf: [u8; 4096], peers_by_address: &HashMap<&String, &String>, sender: &std::net::SocketAddr, inbound_channel: &mpsc::Sender<DataMessage>) -> Result<(), String> {
+    let message_text = match str::from_utf8(&buf) {
+        Ok(text) => {
+            text 
+        },
+        Err(message) => {
+            return Result::Err(format!("Failed to parse incoming message: {}", message));
+        }
+    };
+
+    let raft_message = match serde_json::from_str(message_text.trim_matches(char::from(0))) {
+        Ok(message) => {
+            message
+        },
+        Err(message) => {
+            return Result::Err(format!("Failed to interpret incoming message: {}", message));
+        }
+    };
+    
+    let sender_address = sender.to_string();
+    let peer = match peers_by_address.get(&sender_address) {
+        Some(peer) =>  {
+            peer
+        },
+        None => {
+            return Result::Err(format!("Failed to find name of sender of incoming message: {}", sender_address));
+        }
+    };
+
+    match inbound_channel.send(DataMessage { raft_message: raft_message, peer: (*peer).clone() }) {
+        Ok(_) => {
+            Result::Ok(())
+        },
+        Err(message) => {
+            Result::Err(format!("Failed to pass incoming message onto channel: {}", message))
+        }
+    }
+}
+
 fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, 
     inbound_channel: mpsc::Sender<DataMessage>, 
     outbound_channel: mpsc::Receiver<DataMessage>, 
@@ -315,16 +387,7 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
     let value_lookup = peers.iter().map(|(key, value)| (value, key)).collect::<HashMap<&String, &String>>();
     debug!("Local udp-address: {}", local_address);
 
-    let mut socket = UdpSocket::bind(&local_address);
-    if let Ok(s) = &mut socket {
-        match s.set_read_timeout(Some(Duration::from_millis(10))) {
-            Ok(_) => {},
-            Err(message) => {
-                error!("Failed to set read timeout from socket: {}.", message);
-                return
-            }
-        };
-    }
+    let mut socket = create_socket(&local_address);
 
     let mut random = rand::thread_rng();
     let bad_connection_chance = 0.025;
@@ -336,101 +399,42 @@ fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>,
             break;
         }
 
-        match &socket {
-            Result::Ok(sock) => {
-                if let Ok(msg) = outbound_channel.try_recv() {
+        if let Ok(sock) = &socket {
+            if let Ok(message) = outbound_channel.try_recv() {
+                if bad_connection && transfers_to_miss > 0 {
+                    debug!("Dropped outgoing package!");
+                    transfers_to_miss -= 1;
+                } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
+                    debug!("Dropped outgoing package!");
+                    transfers_to_miss = random.gen_range(1..20);
+                } else {
+                    if let Err(error) = send_outbound_message(message, &peers, &sock) {
+                        error!("{}", error);
+                        break;
+                    }
+                }
+            }
+
+            let mut buf = [0; 4096];
+            if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
+                if number_of_bytes > 0 {
                     if bad_connection && transfers_to_miss > 0 {
-                        debug!("Dropped outgoing package!");
+                        debug!("Dropped incoming package!");
                         transfers_to_miss -= 1;
                     } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                        debug!("Dropped outgoing package!");
+                        debug!("Dropped incoming package!");
                         transfers_to_miss = random.gen_range(1..20);
                     } else {
-                        let message = match serde_json::to_string(&msg.raft_message) {
-                            Ok(message) => message,
-                            Err(message) => {
-                                error!("Failed to parse message: {}", message);
-                                break
-                            }
-                        };
-                        let peer_address = match peers.get(&msg.peer) {
-                            Some(address) => address,
-                            None => {
-                                error!("Could not find address of peer: {}", msg.peer);
-                                break
-                            }
-                        };
-                        match sock.send_to(message.as_bytes(), peer_address) {
-                            Ok(_) => {},
-                            Err(message) => {
-                                error!("Failed to send message to peer: {}", message);
-                                break;
-                            }
-                        };
-                    }
-                }
-
-                let mut buf = [0; 4096];
-                if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
-                    if number_of_bytes > 0 {
-                        if bad_connection && transfers_to_miss > 0 {
-                            debug!("Dropped incoming package!");
-                            transfers_to_miss -= 1;
-                        } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                            debug!("Dropped incoming package!");
-                            transfers_to_miss = random.gen_range(1..20);
-                        } else {
-                            let message_text = match str::from_utf8(&buf) {
-                                Ok(text) => text,
-                                Err(message) => {
-                                    error!("Failed to parse incoming message: {}", message);
-                                    break;
-                                }
-                            };
-                            let message_text = message_text.trim_matches(char::from(0));
-                            let raft_message = match serde_json::from_str(message_text) {
-                                Ok(message) => message,
-                                Err(message) => {
-                                    error!("Failed to interpret incoming message: {}", message);
-                                    break;
-                                }
-                            };
-                            let peer_address = source_address.to_string();
-                            let peer = match value_lookup.get(&peer_address) {
-                                Some(peer) => peer,
-                                None => {
-                                    error!("Failed to find name of sender of incoming message: {}", peer_address);
-                                    break;
-                                }
-                            };
-                            match inbound_channel.send(DataMessage { 
-                                raft_message: raft_message,
-                                peer: (*peer).clone()
-                            }) {
-                                Ok(_) => {},
-                                Err(message) => {
-                                    error!("Failed to pass incoming message onto channel: {}", message);
-                                    break;
-                                }
-                            };
+                        if let Err(error) = send_inbound_message(buf, &value_lookup, &source_address, &inbound_channel) {
+                            error!("{}", error);
+                            break;
                         }
                     }
                 }
             }
-            Result::Err(msg) => {
-                warn!("Failed to bind socket: {}", msg);
-                thread::sleep(Duration::from_millis(1000));
-                socket = UdpSocket::bind(&local_address);
-                if let Ok(s) = &mut socket {
-                    match s.set_read_timeout(Some(Duration::from_millis(10))) {
-                        Ok(_) => {},
-                        Err(message) => {
-                            error!("Failed to set read timeout from socket: {}.", message);
-                            return
-                        }
-                    };
-                }
-            }
+        } else {
+            thread::sleep(Duration::from_millis(1000));
+            socket = create_socket(&local_address);
         }
     }
 }
