@@ -1,9 +1,7 @@
 use rand::Rng;
 use std::collections::HashMap;
 use std::cmp;
-use std::fmt;
 use std::io;
-use std::net::UdpSocket;
 use std::str;
 use std::sync::mpsc;
 use std::thread;
@@ -15,6 +13,11 @@ use getopts::Occur;
 use log::*;
 use serde::Deserialize;
 use serde::Serialize;
+
+mod data;
+mod external_communication;
+mod messages;
+mod system;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -39,73 +42,6 @@ impl ::std::default::Default for Config {
     }
 }
 
-enum SystemMessage {
-    Close
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum RaftMessage {
-    AppendEntries(AppendEntriesData),
-    AppendEntriesResponse(AppendEntriesResponseData),
-    RequestVote(RequestVoteData),
-    RequestVoteResponse(RequestVoteResponseData)
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct AppendEntriesData {
-    term: u64,
-    prev_log_index: Option<usize>,
-    prev_log_term: Option<u64>,
-    entries: Vec<LogPost>,
-    leader_commit: Option<usize>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct AppendEntriesResponseData {
-    term: u64,
-    success: bool,
-    last_log_index: Option<usize>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RequestVoteData {
-    term: u64,
-    last_log_index: Option<usize>,
-    last_log_term: Option<u64>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RequestVoteResponseData {
-    term: u64,
-    vote_granted: bool
-}
-
-impl Clone for RaftMessage {
-    fn clone(&self) -> Self {
-        match self {
-            RaftMessage::AppendEntries(data) => {
-                RaftMessage::AppendEntries(data.clone())
-            },
-            _ => {
-                panic!("Not implemented");
-            }
-        }
-    }
-}
-
-impl fmt::Display for RaftMessage {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            RaftMessage::AppendEntries(data) => {
-                write!(f, "AppendEntries {:?}", data.term)
-            },
-            _ => {
-                panic!("Not implemented");
-            }
-        }
-    }
-}
-
 struct Context {
     name: String,
     random: rand::rngs::ThreadRng,
@@ -113,42 +49,15 @@ struct Context {
     volatile_state: VolatileState
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-struct LogPost {
-    term: u64,
-    value: i32
-}
-
-impl cmp::PartialEq for LogPost {
-    fn eq(&self, other: &Self) -> bool {
-        self.term == other.term && self.value == other.value
-    }
-}
-
-impl fmt::Debug for LogPost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("")
-        .field(&self.term)
-        .field(&self.value)
-        .finish()
-    }
-}
-
 struct PersistentState {
     current_term: u64,
     voted_for: Option<String>,
-    log: Vec<LogPost>
+    log: Vec<data::LogPost>
 }
 
 struct VolatileState {
     commit_index: Option<usize>,
     last_applied: Option<usize>
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DataMessage {
-    raft_message: RaftMessage,
-    peer: String
 }
 
 struct LogMessage {
@@ -227,10 +136,10 @@ fn main() {
     let (outbound_channel_entrance, outbound_channel_exit) = mpsc::channel();
     let (log_channel, log_channel_reader) = mpsc::channel();
 
-    let (udp_system_channel, udp_system_channel_reader) = mpsc::channel();
     let (loop_system_channel, loop_system_channel_reader) = mpsc::channel();
 
-    let upd_handle = thread::spawn(move || { udp_loop(udp_system_channel_reader, inbound_channel_entrance, outbound_channel_exit, local_address, peers, bad_connection); });
+    let _external_connection = external_communication::ExternalConnection::new(inbound_channel_entrance, outbound_channel_exit, local_address, peers, bad_connection);
+
     let loop_handle = thread::spawn(move || { main_loop(name, loop_system_channel_reader, inbound_channel_exit, outbound_channel_entrance, log_channel_reader, &timeout_config, peer_names); });
 
     let stdin = io::stdin();
@@ -271,25 +180,13 @@ fn main() {
 
     info!("Initiating exit.");
 
-    match udp_system_channel.send(SystemMessage::Close) {
-        Ok(_) => {},
-        Err(message) => {
-            error!("Failed to send close-message to the udp-channel: {}", message);
-        }
-    };
-    match loop_system_channel.send(SystemMessage::Close) {
+    match loop_system_channel.send(system::SystemMessage::Close) {
         Ok(_) => {},
         Err(message) => {
             error!("Failed to send close-message to the loop-channel: {}", message);
         }
     };
 
-    match upd_handle.join() {
-        Ok(_) => {},
-        Err(message) => {
-            error!("Failed to join the udp-channel: {:?}", message);
-        }
-    };
     match loop_handle.join() {
         Ok(_) => {},
         Err(message) => {
@@ -298,145 +195,6 @@ fn main() {
     };
 
     info!("Node exiting!");
-}
-
-fn create_socket(address: &str) -> Result<std::net::UdpSocket, std::io::Error> {
-    let mut socket = UdpSocket::bind(address);
-
-    if let Ok(s) = &mut socket {
-        match s.set_read_timeout(Some(Duration::from_millis(10))) {
-            Ok(_) => {},
-            Err(message) => {
-                error!("Failed to set read timeout for socket: {}", message);
-            }
-        }
-    }
-
-    socket
-}
-
-fn send_outbound_message(message: DataMessage, peers: &HashMap<String, String>, socket: &UdpSocket) -> Result<(), String> {
-    let msg = match serde_json::to_string(&message.raft_message) {
-        Ok(msg) => msg,
-        Err(msg) => {
-            return Result::Err(format!("Failed to parse message: {}", msg));
-        }
-    };
-    let peer_address = match peers.get(&message.peer) {
-        Some(address) => address,
-        None => {
-            return Result::Err(format!("Could not find address of peer: {}", message.peer));
-        }
-    };
-    match socket.send_to(msg.as_bytes(), peer_address) {
-        Ok(_) => {
-            return Result::Ok(());
-        },
-        Err(m) => {
-            return Result::Err(format!("Failed to send message to peer: {}", m));
-        }
-    };
-}
-
-fn send_inbound_message(buf: [u8; 4096], peers_by_address: &HashMap<&String, &String>, sender: &std::net::SocketAddr, inbound_channel: &mpsc::Sender<DataMessage>) -> Result<(), String> {
-    let message_text = match str::from_utf8(&buf) {
-        Ok(text) => {
-            text 
-        },
-        Err(message) => {
-            return Result::Err(format!("Failed to parse incoming message: {}", message));
-        }
-    };
-
-    let raft_message = match serde_json::from_str(message_text.trim_matches(char::from(0))) {
-        Ok(message) => {
-            message
-        },
-        Err(message) => {
-            return Result::Err(format!("Failed to interpret incoming message: {}", message));
-        }
-    };
-    
-    let sender_address = sender.to_string();
-    let peer = match peers_by_address.get(&sender_address) {
-        Some(peer) =>  {
-            peer
-        },
-        None => {
-            return Result::Err(format!("Failed to find name of sender of incoming message: {}", sender_address));
-        }
-    };
-
-    match inbound_channel.send(DataMessage { raft_message: raft_message, peer: (*peer).clone() }) {
-        Ok(_) => {
-            Result::Ok(())
-        },
-        Err(message) => {
-            Result::Err(format!("Failed to pass incoming message onto channel: {}", message))
-        }
-    }
-}
-
-fn udp_loop(system_channel: mpsc::Receiver<SystemMessage>, 
-    inbound_channel: mpsc::Sender<DataMessage>, 
-    outbound_channel: mpsc::Receiver<DataMessage>, 
-    local_address: String, 
-    peers: HashMap<String, String>,
-    bad_connection: bool) {
-
-    let value_lookup = peers.iter().map(|(key, value)| (value, key)).collect::<HashMap<&String, &String>>();
-    debug!("Local udp-address: {}", local_address);
-
-    let mut socket = create_socket(&local_address);
-
-    let mut random = rand::thread_rng();
-    let bad_connection_chance = 0.025;
-    let mut transfers_to_miss = 0;
-
-    loop {
-        if let Ok(SystemMessage::Close) = system_channel.try_recv() {
-            info!("UDP Connection exiting!");
-            break;
-        }
-
-        if let Ok(sock) = &socket {
-            if let Ok(message) = outbound_channel.try_recv() {
-                if bad_connection && transfers_to_miss > 0 {
-                    debug!("Dropped outgoing package!");
-                    transfers_to_miss -= 1;
-                } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                    debug!("Dropped outgoing package!");
-                    transfers_to_miss = random.gen_range(1..20);
-                } else {
-                    if let Err(error) = send_outbound_message(message, &peers, &sock) {
-                        error!("{}", error);
-                        break;
-                    }
-                }
-            }
-
-            let mut buf = [0; 4096];
-            if let Result::Ok((number_of_bytes, source_address)) = sock.recv_from(&mut buf) {
-                if number_of_bytes > 0 {
-                    if bad_connection && transfers_to_miss > 0 {
-                        debug!("Dropped incoming package!");
-                        transfers_to_miss -= 1;
-                    } else if bad_connection && bad_connection_chance > random.gen_range(0.0..1.0) {
-                        debug!("Dropped incoming package!");
-                        transfers_to_miss = random.gen_range(1..20);
-                    } else {
-                        if let Err(error) = send_inbound_message(buf, &value_lookup, &source_address, &inbound_channel) {
-                            error!("{}", error);
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            thread::sleep(Duration::from_millis(1000));
-            socket = create_socket(&local_address);
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -468,47 +226,7 @@ enum Role {
     Leader(LeaderData)
 }
 
-fn get_message_term(message: &RaftMessage) -> u64 {
-    match message {
-        RaftMessage::AppendEntries(data) => data.term,
-        RaftMessage::AppendEntriesResponse(data) => data.term,
-        RaftMessage::RequestVote(data) => data.term,
-        RaftMessage::RequestVoteResponse(data) => data.term
-    }
-}
-
-// Append entries to the log starting at start_pos, skipping duplicates and dropping all leftover entries in the log
-fn append_entries_from(log: &mut Vec<LogPost>, entries: &Vec<LogPost>, start_pos: &Option<usize>) {
-    if entries.len() == 0 {
-        return
-    } else if log.len() == 0 {
-        log.extend(entries.iter().cloned());
-        return
-    }
-    let mut pos_offset = 0;
-    let start_pos : usize = start_pos.unwrap_or_default();
-    loop {
-        if let Some(new_entry) = entries.get(pos_offset) {
-            if let Some(old_entry) = log.get(start_pos + pos_offset + 1) {
-                if new_entry == old_entry {
-                    pos_offset += 1
-                } else {
-                    log.drain((start_pos + pos_offset + 1)..);
-                    log.extend(entries[pos_offset..].iter().cloned());
-                    break
-                }
-            } else {
-                log.extend(entries[pos_offset..].iter().cloned());
-                break
-            }
-        } else {
-            log.drain((start_pos + pos_offset + 1)..);
-            break
-        }
-    }
-}
-
-fn handle_append_entries(role: Role, append_entries: &AppendEntriesData, config: &TimeoutConfig, context: &mut Context, peer: &String) -> (Role, Vec<DataMessage>) {
+fn handle_append_entries(role: Role, append_entries: &messages::AppendEntriesData, config: &TimeoutConfig, context: &mut Context, peer: &String) -> (Role, Vec<messages::DataMessage>) {
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Receiver rule 1:
     if append_entries.term < context.persistent_state.current_term {
@@ -537,7 +255,7 @@ fn handle_append_entries(role: Role, append_entries: &AppendEntriesData, config:
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Receiver rule 3 and 4:
-    append_entries_from(&mut context.persistent_state.log, &append_entries.entries, &append_entries.prev_log_index);
+    data::append_entries_from(&mut context.persistent_state.log, &append_entries.entries, &append_entries.prev_log_index);
     //////////////////////////////////////////////////////////////////////////////////////////////
 
     let mut last_log_index = None;
@@ -566,7 +284,7 @@ fn handle_append_entries(role: Role, append_entries: &AppendEntriesData, config:
     (become_follower(config, context), messages)
 }
 
-fn handle_request_vote(data: &RequestVoteData, candidate: &String, _config: &TimeoutConfig, context: &mut Context) -> bool {
+fn handle_request_vote(data: &messages::RequestVoteData, candidate: &String, _config: &TimeoutConfig, context: &mut Context) -> bool {
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Receiver rule 1:
     if data.term < context.persistent_state.current_term {
@@ -581,7 +299,7 @@ fn handle_request_vote(data: &RequestVoteData, candidate: &String, _config: &Tim
             return false
         }
     }
-    let result = check_last_log_post(&data.last_log_index, &data.last_log_term, &context.persistent_state.log);
+    let result = data::check_last_log_post(&data.last_log_index, &data.last_log_term, &context.persistent_state.log);
     //////////////////////////////////////////////////////////////////////////////////////////////
 
     if result {
@@ -595,7 +313,7 @@ fn handle_request_vote(data: &RequestVoteData, candidate: &String, _config: &Tim
 fn tick_follower(follower: FollowerData, 
     peers: &Vec<String>, 
     config: &TimeoutConfig, 
-    context: &mut Context) -> (Role, Vec<DataMessage>) {
+    context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Followers 2
@@ -612,7 +330,7 @@ fn tick_follower(follower: FollowerData,
 fn tick_candidate(candidate: CandidateData, 
     peers: &Vec<String>, 
     config: &TimeoutConfig, 
-    context: &mut Context) -> (Role, Vec<DataMessage>) {
+    context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Candidate 2
@@ -635,7 +353,7 @@ fn tick_candidate(candidate: CandidateData,
 fn tick_leader(mut leader: LeaderData, 
     peers: &Vec<String>, 
     config: &TimeoutConfig, 
-    context: &mut Context) -> (Role, Vec<DataMessage>) {
+    context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Leader 1 part 2
@@ -693,12 +411,12 @@ fn tick_leader(mut leader: LeaderData,
                             }
                         };
                     }
-                    debug!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
+                    debug!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, data::get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
                     messages.push(create_append_entries(
                         &context.persistent_state.current_term, 
                         &prev_log_index, 
                         &prev_log_term, 
-                        &get_log_range(&Some(*next_index), &context.persistent_state.log), 
+                        &data::get_log_range(&Some(*next_index), &context.persistent_state.log), 
                         &context.volatile_state.commit_index, 
                         peer))
                 }
@@ -759,45 +477,6 @@ fn tick_leader(mut leader: LeaderData,
     }
 }
 
-fn get_log_range(from_index: &Option<usize>, log: &Vec<LogPost>) -> Vec<LogPost> {
-    if let Some(start_index) = from_index {
-        log[*start_index..].iter().cloned().collect()
-    } else {
-        log.iter().cloned().collect()
-    }
-}
-
-fn check_last_log_post(last_log_index: &Option<usize>, last_log_term: &Option<u64>, log: &Vec<LogPost>) -> bool {
-    if log.len() == 0 {
-        last_log_index.is_none() && last_log_term.is_none()
-    } else {
-        match last_log_index {
-            None => false,
-            Some(index) => {
-                match last_log_term {
-                    None => false,
-                    Some(term) => {
-                        if log.len() - 1 > *index {
-                            false
-                        } else if log.len() - 1 < *index {
-                            true
-                        } else {
-                            match log.get(*index) {
-                                Some(post) => {
-                                    post.term == *term
-                                },
-                                None => {
-                                    panic!("We are sure there is a post at index");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
     return Role::Follower(FollowerData{
         election_timeout: Instant::now(),
@@ -805,7 +484,7 @@ fn become_follower(config: &TimeoutConfig, context: &mut Context) -> Role {
     })
 }
 
-fn become_candidate(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn become_candidate(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Candidate 1
     context.persistent_state.current_term += 1;
@@ -832,14 +511,14 @@ fn become_candidate(peers: &Vec<String>, config: &TimeoutConfig, context: &mut C
     //////////////////////////////////////////////////////////////////////////////////////////////
 }
 
-fn top(list: &Vec<LogPost>) -> Option<&LogPost> {
+fn top(list: &Vec<data::LogPost>) -> Option<&data::LogPost> {
     match list.len() {
         0 => None,
         n => Some(&list[n-1])
     }
 }
 
-fn become_leader(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn become_leader(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: Leader 1 part 1
     let prev_log_term = match top(&context.persistent_state.log) {
@@ -876,7 +555,7 @@ fn become_leader(peers: &Vec<String>, config: &TimeoutConfig, context: &mut Cont
     }), messages)
 }
 
-fn create_request_votes(term: &u64, last_log_index: &Option<usize>, last_log_term: &Option<u64>, peers: &Vec<String>) -> Vec<DataMessage> {
+fn create_request_votes(term: &u64, last_log_index: &Option<usize>, last_log_term: &Option<u64>, peers: &Vec<String>) -> Vec<messages::DataMessage> {
     let mut messages = Vec::new();
 
     for peer in peers.iter() {
@@ -886,7 +565,7 @@ fn create_request_votes(term: &u64, last_log_index: &Option<usize>, last_log_ter
     messages
 }
 
-fn create_append_entrieses(term: &u64, prev_log_index: &Option<usize>, prev_log_term: &Option<u64>, entries: &Vec<LogPost>, leader_commit: &Option<usize>, followers: &Vec<String>) -> Vec<DataMessage> {
+fn create_append_entrieses(term: &u64, prev_log_index: &Option<usize>, prev_log_term: &Option<u64>, entries: &Vec<data::LogPost>, leader_commit: &Option<usize>, followers: &Vec<String>) -> Vec<messages::DataMessage> {
     let mut messages = Vec::new();
 
     for follower in followers.iter() {
@@ -896,9 +575,9 @@ fn create_append_entrieses(term: &u64, prev_log_index: &Option<usize>, prev_log_
     messages
 }
 
-fn create_request_vote(term: &u64, last_log_index: &Option<usize>, last_log_term: &Option<u64>, peer: &String) -> DataMessage {
-    DataMessage { 
-        raft_message: RaftMessage::RequestVote(RequestVoteData{ 
+fn create_request_vote(term: &u64, last_log_index: &Option<usize>, last_log_term: &Option<u64>, peer: &String) -> messages::DataMessage {
+    messages::DataMessage { 
+        raft_message: messages::RaftMessage::RequestVote(messages::RequestVoteData{ 
             term: *term,
             last_log_index: *last_log_index,
             last_log_term: *last_log_term
@@ -907,9 +586,9 @@ fn create_request_vote(term: &u64, last_log_index: &Option<usize>, last_log_term
     }
 }
 
-fn create_request_vote_response(term: &u64, vote_granted: bool, candidate: &String) -> DataMessage {
-    DataMessage { 
-        raft_message: RaftMessage::RequestVoteResponse(RequestVoteResponseData { 
+fn create_request_vote_response(term: &u64, vote_granted: bool, candidate: &String) -> messages::DataMessage {
+    messages::DataMessage { 
+        raft_message: messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData { 
             term: *term,
             vote_granted: vote_granted
         }), 
@@ -917,9 +596,9 @@ fn create_request_vote_response(term: &u64, vote_granted: bool, candidate: &Stri
     }
 }
 
-fn create_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log_term: &Option<u64>, entries: &Vec<LogPost>, leader_commit: &Option<usize>, follower: &String) -> DataMessage {
-    DataMessage { 
-        raft_message: RaftMessage::AppendEntries(AppendEntriesData {
+fn create_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log_term: &Option<u64>, entries: &Vec<data::LogPost>, leader_commit: &Option<usize>, follower: &String) -> messages::DataMessage {
+    messages::DataMessage { 
+        raft_message: messages::RaftMessage::AppendEntries(messages::AppendEntriesData {
             term: *term,
             prev_log_index: *prev_log_index,
             prev_log_term: *prev_log_term,
@@ -930,9 +609,9 @@ fn create_append_entries(term: &u64, prev_log_index: &Option<usize>, prev_log_te
     }
 }
 
-fn create_append_entries_response(term: &u64, success: &bool, last_log_index: &Option<usize>, leader: &String) -> Vec<DataMessage> {
-    vec!(DataMessage { 
-        raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData {
+fn create_append_entries_response(term: &u64, success: &bool, last_log_index: &Option<usize>, leader: &String) -> Vec<messages::DataMessage> {
+    vec!(messages::DataMessage { 
+        raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData {
             term: *term,
             success: *success,
             last_log_index: *last_log_index
@@ -941,7 +620,7 @@ fn create_append_entries_response(term: &u64, success: &bool, last_log_index: &O
     })
 }
 
-fn receive_log(role: Role, message: LogMessage, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn receive_log(role: Role, message: LogMessage, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     match role {
         Role::Follower(_) => {
             warn!("Follower can not receive incoming data.");
@@ -963,7 +642,7 @@ fn receive_log(role: Role, message: LogMessage, context: &mut Context) -> (Role,
 fn tick_role(role: Role, 
     peers: &Vec<String>, 
     config: &TimeoutConfig, 
-    context: &mut Context) -> (Role, Vec<DataMessage>) {
+    context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: All servers 1
@@ -1001,10 +680,10 @@ fn tick_role(role: Role,
     }
 }
 
-fn message_role(role: Role, message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn message_role(role: Role, message: &messages::RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     //////////////////////////////////////////////////////////////////////////////////////////////
     // Rule: All servers 2
-    let term = get_message_term(&message);
+    let term = messages::get_message_term(&message);
     let mut should_become_follower = false;
     if term > context.persistent_state.current_term {
         context.persistent_state.current_term = term;
@@ -1033,20 +712,20 @@ fn message_role(role: Role, message: &RaftMessage, peer: &String, config: &Timeo
 }
 
 fn leader_receive_log(mut leader: LeaderData, value: i32, context: &mut Context) -> Role {
-    context.persistent_state.log.push(LogPost { term: context.persistent_state.current_term, value });
+    context.persistent_state.log.push(data::LogPost { term: context.persistent_state.current_term, value });
     leader.idle_timeout = Instant::now();
     Role::Leader(leader)
 }
 
-fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn message_follower(follower: FollowerData, raft_message: &messages::RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     match raft_message {
         //////////////////////////////////////////////////////////////////////////////////////////
         // Rule: Followers 1
-        RaftMessage::AppendEntries(data) => {
+        messages::RaftMessage::AppendEntries(data) => {
             debug!("F {}: Received AppendEntries from {} term: {}", context.persistent_state.current_term, peer, data.term);
             handle_append_entries(Role::Follower(follower), &data, config, context, &peer)
         },
-        RaftMessage::RequestVote(data) => {
+        messages::RaftMessage::RequestVote(data) => {
             debug!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, peer, data.term);
             if handle_request_vote(&data, &peer, config, context) {
                 (become_follower(config, context), vec!(create_request_vote_response(&context.persistent_state.current_term, true, &peer)))
@@ -1055,12 +734,12 @@ fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &S
             }
         },
         //////////////////////////////////////////////////////////////////////////////////////////
-        RaftMessage::AppendEntriesResponse(data) => {
+        messages::RaftMessage::AppendEntriesResponse(data) => {
             debug!("F {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
             // Old or misguided message, ignore
             (Role::Follower(follower), Vec::new())
         },
-        RaftMessage::RequestVoteResponse(data) => {
+        messages::RaftMessage::RequestVoteResponse(data) => {
             debug!("F {}: Received RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             // Old or misguided message, ignore
             (Role::Follower(follower), Vec::new())
@@ -1068,26 +747,26 @@ fn message_follower(follower: FollowerData, raft_message: &RaftMessage, peer: &S
     }
 }
 
-fn message_candidate(mut candidate: CandidateData, raft_message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn message_candidate(mut candidate: CandidateData, raft_message: &messages::RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     match raft_message {
-        RaftMessage::AppendEntries(data) => {
+        messages::RaftMessage::AppendEntries(data) => {
             debug!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, peer, data.term);
             //////////////////////////////////////////////////////////////////////////////////////
             // Rule: Candidate 3
             handle_append_entries(Role::Candidate(candidate), &data, config, context, &peer)
             //////////////////////////////////////////////////////////////////////////////////////
         },
-        RaftMessage::AppendEntriesResponse(data) => {
+        messages::RaftMessage::AppendEntriesResponse(data) => {
             debug!("C {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
             // Old or misguided message, ignore
             (Role::Candidate(candidate), Vec::new())
         },
-        RaftMessage::RequestVote(data) => {
+        messages::RaftMessage::RequestVote(data) => {
             debug!("C {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
             let result = handle_request_vote(&data, &peer, config, context);
             (Role::Candidate(candidate), vec!(create_request_vote_response(&context.persistent_state.current_term, result, &peer)))
         },
-        RaftMessage::RequestVoteResponse(data) => {
+        messages::RaftMessage::RequestVoteResponse(data) => {
             debug!("C {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             if data.term > context.persistent_state.current_term {
                 context.persistent_state.current_term = data.term;
@@ -1104,13 +783,13 @@ fn message_candidate(mut candidate: CandidateData, raft_message: &RaftMessage, p
     }
 }
 
-fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<DataMessage>) {
+fn message_leader(mut leader: LeaderData, raft_message: &messages::RaftMessage, peer: &String, config: &TimeoutConfig, context: &mut Context) -> (Role, Vec<messages::DataMessage>) {
     match raft_message {
-        RaftMessage::AppendEntries(data) => {
+        messages::RaftMessage::AppendEntries(data) => {
             debug!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, peer, data.term);
             handle_append_entries(Role::Leader(leader), &data, config, context, &peer)
         },
-        RaftMessage::AppendEntriesResponse(data) => {
+        messages::RaftMessage::AppendEntriesResponse(data) => {
             debug!("L {}: AppendEntriesResponse from {} with {} term {}", context.persistent_state.current_term, peer, data.success, data.term);
             if data.term > context.persistent_state.current_term {
                 context.persistent_state.current_term = data.term;
@@ -1152,12 +831,12 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
                 (Role::Leader(leader), messages)
             }
         },
-        RaftMessage::RequestVote(data) => {
+        messages::RaftMessage::RequestVote(data) => {
             debug!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
             let result = handle_request_vote(&data, &peer, config, context);
             (Role::Leader(leader), vec!(create_request_vote_response(&context.persistent_state.current_term, result, &peer)))
         },
-        RaftMessage::RequestVoteResponse(data) => {
+        messages::RaftMessage::RequestVoteResponse(data) => {
             debug!("L {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
             // Ignore for now
             (Role::Leader(leader), Vec::new())
@@ -1165,7 +844,7 @@ fn message_leader(mut leader: LeaderData, raft_message: &RaftMessage, peer: &Str
     }
 }
 
-fn apply_log_post(_log_post: &LogPost) {
+fn apply_log_post(_log_post: &data::LogPost) {
     // Here we shall apply commmitted log posts to the state machine
 }
 
@@ -1173,9 +852,9 @@ fn randomize_timeout(base: &u64, random: &mut rand::rngs::ThreadRng) -> u128 {
     u128::from(base + random.gen_range(1..*base))
 }
 
-fn main_loop(name: String, system_channel: mpsc::Receiver<SystemMessage>, 
-    inbound_channel: mpsc::Receiver<DataMessage>, 
-    outbound_channel: mpsc::Sender<DataMessage>, 
+fn main_loop(name: String, system_channel: mpsc::Receiver<system::SystemMessage>, 
+    inbound_channel: mpsc::Receiver<messages::DataMessage>, 
+    outbound_channel: mpsc::Sender<messages::DataMessage>, 
     log_channel: mpsc::Receiver<LogMessage>,
     config: &TimeoutConfig, 
     peers: Vec<String>) {
@@ -1234,90 +913,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn when_append_entries_from_given_empty_log_then_append_all() {
-        let mut a = Vec::new();
-        let b = vec!(LogPost { term: 0, value: 0 });
-
-        let expected = vec!(LogPost { term: 0, value: 0 });
-
-        append_entries_from(&mut a, &b, &None);
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_heartbeat_then_do_nothing() {
-        let mut a = vec!(LogPost { term: 0, value: 0 });
-        let b = Vec::new();
-
-        let expected = vec!(LogPost { term: 0, value: 0 });
-
-        append_entries_from(&mut a, &b, &None);
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_new_log_post_then_append() {
-        let mut a = vec!(LogPost { term: 0, value: 0 });
-        let b = vec!(LogPost { term: 1, value: 2 });
-
-        let expected = vec!(LogPost { term: 0, value: 0 }, LogPost { term: 1, value: 2 });
-
-        append_entries_from(&mut a, &b, &Some(0));
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_conflicting_posts_then_replace() {
-        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 });
-        let b = vec!(LogPost { term: 1, value: 2});
-
-        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 1, value: 2 });
-
-        append_entries_from(&mut a, &b, &Some(0));
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_partly_overlapping_posts_then_append_new_posts() {
-        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 });
-        let b = vec!(LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
-
-        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
-
-        append_entries_from(&mut a, &b, &Some(0));
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_completely_overlapping_posts_then_do_nothing() {
-        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 }, LogPost { term: 1, value: 2 });
-        let b = vec!(LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
-
-        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
-
-        append_entries_from(&mut a, &b, &Some(0));
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn when_append_entries_from_given_new_leader_heartbeat_then_do_nothing() {
-        let mut a = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1 }, LogPost { term: 1, value: 2 });
-        let b = Vec::new();
-
-        let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
-
-        append_entries_from(&mut a, &b, &None);
-
-        assert_eq!(a, expected);
-    }
-
-    #[test]
     fn when_handle_append_entries_given_append_entries_with_old_term_then_signal_failure() {
 
         let mut context = create_context();
@@ -1330,14 +925,14 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
     }
 
     #[test]
     fn when_handle_append_entries_given_append_entries_with_previous_log_conflict_then_signal_failure() {
         let mut context = create_context();
-        context.persistent_state.log.push(LogPost { term: 4, value: 1 });
+        context.persistent_state.log.push(data::LogPost { term: 4, value: 1 });
 
         let config = create_config();
 
@@ -1348,7 +943,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
     }
 
@@ -1365,7 +960,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
     }
 
@@ -1380,15 +975,15 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
     }
 
     #[test]
     fn when_handle_append_entries_given_append_entries_with_conflicting_new_posts_then_replace_conflicting_posts() {
         let mut context = create_context();
-        context.persistent_state.log.push(LogPost { term: 2, value: 13 });
-        context.persistent_state.log.push(LogPost { term: 3, value: 17 });
+        context.persistent_state.log.push(data::LogPost { term: 2, value: 13 });
+        context.persistent_state.log.push(data::LogPost { term: 3, value: 17 });
 
         let config = create_config();
 
@@ -1397,7 +992,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
     }
 
@@ -1412,7 +1007,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
         assert_eq!(context.persistent_state.log.len(), 3);
         assert_eq!(context.volatile_state.commit_index.unwrap(), 2);
@@ -1430,7 +1025,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
         assert_eq!(context.persistent_state.log.len(), 3);
         assert_eq!(context.volatile_state.commit_index.unwrap(), 1);
@@ -1448,7 +1043,7 @@ mod tests {
         let (role, messages) = handle_append_entries(create_follower(), &append_entries, &config, &mut context, &String::from("peer"));
 
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. }), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. }), .. }));
         assert!(matches!(role, Role::Follower{..}));
         assert_eq!(context.persistent_state.log.len(), 3);
         assert_eq!(context.volatile_state.commit_index.unwrap(), 2);
@@ -1463,7 +1058,7 @@ mod tests {
 
         let role = create_candidate();
 
-        let message = RaftMessage::RequestVote(create_request_vote_data());
+        let message = messages::RaftMessage::RequestVote(create_request_vote_data());
 
         let result = message_role(role, &message, &String::from("peer 1"), &config, &mut context);
 
@@ -1483,7 +1078,7 @@ mod tests {
 
         let mut data = create_request_vote_data();
         data.term = 0;
-        let message = RaftMessage::RequestVote(data);
+        let message = messages::RaftMessage::RequestVote(data);
 
         let result = message_follower(follower, &message, &String::from("leader"), &config, &mut context);
 
@@ -1504,7 +1099,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: context.persistent_state.current_term - 1,
             entries: Vec::new(),
             leader_commit: Some(0),
@@ -1515,15 +1110,15 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
     }
 
     #[test]
@@ -1532,7 +1127,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: context.persistent_state.current_term,
             entries: Vec::new(),
             leader_commit: Some(0),
@@ -1543,15 +1138,15 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
     }
 
     #[test]
@@ -1560,7 +1155,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: context.persistent_state.current_term,
             entries: Vec::new(),
             leader_commit: Some(0),
@@ -1571,60 +1166,60 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: false, .. })));
     }
 
     #[test]
     fn when_append_entries_given_conflicting_new_terms_then_remove_old_and_append_new() {
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: 5,
-            entries: vec!(LogPost { term: 2, value: 9 }, LogPost { term: 2, value: 7 }, LogPost { term: 3, value: 8 }),
+            entries: vec!(data::LogPost { term: 2, value: 9 }, data::LogPost { term: 2, value: 7 }, data::LogPost { term: 3, value: 8 }),
             leader_commit: Some(0),
             prev_log_index: Some(0),
             prev_log_term: Some(1)
         });
 
-        let expected = vec!(LogPost { term: 1, value: 0}, LogPost { term: 2, value: 9 }, LogPost { term: 2, value: 7 }, LogPost { term: 3, value: 8 });
+        let expected = vec!(data::LogPost { term: 1, value: 0}, data::LogPost { term: 2, value: 9 }, data::LogPost { term: 2, value: 7 }, data::LogPost { term: 3, value: 8 });
 
         let mut context = create_context();
-        context.persistent_state.log.push(LogPost { term: 4, value: 17 });
+        context.persistent_state.log.push(data::LogPost { term: 4, value: 17 });
         let (_role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.persistent_state.log, expected);
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
-        context.persistent_state.log.push(LogPost { term: 4, value: 17 });
+        context.persistent_state.log.push(data::LogPost { term: 4, value: 17 });
         let (_role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.persistent_state.log, expected);
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
-        context.persistent_state.log.push(LogPost { term: 4, value: 17 });
+        context.persistent_state.log.push(data::LogPost { term: 4, value: 17 });
         let (_role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.persistent_state.log, expected);
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
     }
 
     #[test]
     fn when_append_entries_given_new_leader_commit_less_than_log_len_then_set_commit_index_to_leader_commit() {
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: 5,
-            entries: vec!(LogPost { term: 2, value: 9 }),
+            entries: vec!(data::LogPost { term: 2, value: 9 }),
             leader_commit: Some(1),
             prev_log_index: Some(1),
             prev_log_term: Some(1)
@@ -1635,30 +1230,30 @@ mod tests {
         let (_role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(1));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
         context.volatile_state.commit_index = Some(0);
         let (_role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(1));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
         context.volatile_state.commit_index = Some(0);
         let (_role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(1));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
     }
 
     #[test]
     fn when_append_entries_given_new_leader_commit_greater_than_log_len_then_set_commit_index_to_log_len() {
         let config = create_config();
 
-        let message = RaftMessage::AppendEntries(AppendEntriesData{
+        let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
             term: 5,
-            entries: vec!(LogPost { term: 2, value: 9 }),
+            entries: vec!(data::LogPost { term: 2, value: 9 }),
             leader_commit: Some(7),
             prev_log_index: Some(1),
             prev_log_term: Some(1)
@@ -1669,21 +1264,21 @@ mod tests {
         let (_role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(2));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
         context.volatile_state.commit_index = Some(0);
         let (_role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(2));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
 
         let mut context = create_context();
         context.volatile_state.commit_index = Some(0);
         let (_role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert_eq!(context.volatile_state.commit_index, Some(2));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::AppendEntriesResponse(AppendEntriesResponseData{ success: true, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
     }
 
     #[test]
@@ -1692,7 +1287,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::RequestVote(RequestVoteData{
+        let message = messages::RaftMessage::RequestVote(messages::RequestVoteData{
             term: context.persistent_state.current_term - 1,
             last_log_index: Some(1),
             last_log_term: Some(1)
@@ -1701,17 +1296,17 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, term: 5 })));
 
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, term: 5 })));
 
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, term: 5 })));
     }
 
     #[test]
@@ -1721,7 +1316,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::RequestVote(RequestVoteData{
+        let message = messages::RaftMessage::RequestVote(messages::RequestVoteData{
             term: context.persistent_state.current_term,
             last_log_index: Some(1),
             last_log_term: Some(1)
@@ -1730,17 +1325,17 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
 
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
 
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
     }
 
     #[test]
@@ -1749,7 +1344,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::RequestVote(RequestVoteData{
+        let message = messages::RaftMessage::RequestVote(messages::RequestVoteData{
             term: context.persistent_state.current_term,
             last_log_index: Some(0),
             last_log_term: Some(1)
@@ -1758,17 +1353,17 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
 
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
 
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: false, .. })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: false, .. })));
     }
 
     #[test]
@@ -1777,7 +1372,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::RequestVote(RequestVoteData{
+        let message = messages::RaftMessage::RequestVote(messages::RequestVoteData{
             term: context.persistent_state.current_term + 1,
             last_log_index: Some(1),
             last_log_term: Some(1)
@@ -1787,19 +1382,19 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 6 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 6 })));
 
         context.persistent_state.current_term = 5;
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 6 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 6 })));
 
         context.persistent_state.current_term = 5;
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 6 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 6 })));
     }
 
     #[test]
@@ -1809,7 +1404,7 @@ mod tests {
 
         let config = create_config();
 
-        let message = RaftMessage::RequestVote(RequestVoteData{
+        let message = messages::RaftMessage::RequestVote(messages::RequestVoteData{
             term: context.persistent_state.current_term,
             last_log_index: Some(1),
             last_log_term: Some(1)
@@ -1818,17 +1413,17 @@ mod tests {
         let (role, messages) = message_role(Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Follower(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
 
         let (role, messages) = message_role(Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
 
         let (role, messages) = message_role(Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
         assert!(matches!(role, Role::Leader(..)));
         assert_eq!(messages.len(), 1);
-        assert!(matches!(messages.get(0).unwrap().raft_message, RaftMessage::RequestVoteResponse(RequestVoteResponseData{ vote_granted: true, term: 5 })));
+        assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
     }
 
     #[test]
@@ -1888,7 +1483,7 @@ mod tests {
 
         assert!(matches!(role, Role::Candidate(..)));
         assert_eq!(messages.len(), 2);
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::RequestVote(..), ..}));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::RequestVote(..), ..}));
     }
 
     #[test]
@@ -1901,7 +1496,7 @@ mod tests {
         follower.election_timeout = Instant::now() - Duration::new(500, 0);
         let elapsed = follower.election_timeout.elapsed().as_millis();
 
-        let message = RaftMessage::AppendEntries(create_append_entries_data());
+        let message = messages::RaftMessage::AppendEntries(create_append_entries_data());
 
         let result = message_follower(follower, &message, &String::from("leader"), &config, &mut context);
 
@@ -1925,7 +1520,7 @@ mod tests {
         follower.election_timeout = Instant::now() - Duration::new(500, 0);
         let elapsed = follower.election_timeout.elapsed().as_millis();
 
-        let message = RaftMessage::RequestVote(create_request_vote_data());
+        let message = messages::RaftMessage::RequestVote(create_request_vote_data());
 
         let result = message_follower(follower, &message, &String::from("leader"), &config, &mut context);
 
@@ -2001,7 +1596,7 @@ mod tests {
         let (_role, messages) = become_candidate(&peers, &config, &mut context);
 
         assert_eq!(messages.len(), peers.len());
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::RequestVote(..), ..}));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::RequestVote(..), ..}));
     }
 
     #[test]
@@ -2028,7 +1623,7 @@ mod tests {
 
         let candidate = create_candidate_data();
 
-        let message = RaftMessage::AppendEntries(create_append_entries_data());
+        let message = messages::RaftMessage::AppendEntries(create_append_entries_data());
 
         let (role, _messages) = message_candidate(candidate, &message, &String::from("new leader"), &config, &mut context);
 
@@ -2063,7 +1658,7 @@ mod tests {
         let (_role, messages) = become_leader(&peers, &config, &mut context);
 
         assert_eq!(messages.len(), peers.len());
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntries(..), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntries(..), .. }));
     }
 
     #[test]
@@ -2081,7 +1676,7 @@ mod tests {
         let (_role, messages) = tick_leader(leader, &peers, &config, &mut context);
 
         assert_eq!(messages.len(), peers.len());
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntries(..), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntries(..), .. }));
     }
 
     #[test]
@@ -2101,7 +1696,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages.get(0).unwrap().peer, String::from("peer 1"));
-        assert!(matches!(messages.get(0).unwrap(), DataMessage { raft_message: RaftMessage::AppendEntries(..), .. }));
+        assert!(matches!(messages.get(0).unwrap(), messages::DataMessage { raft_message: messages::RaftMessage::AppendEntries(..), .. }));
     }
 
     #[test]
@@ -2117,7 +1712,7 @@ mod tests {
 
         let mut message = create_append_entries_response_data();
         message.last_log_index = Some(1);
-        let message = RaftMessage::AppendEntriesResponse(message);
+        let message = messages::RaftMessage::AppendEntriesResponse(message);
 
         let result = message_leader(leader, &message, &String::from("peer 1"), &config, &mut context);
 
@@ -2144,7 +1739,7 @@ mod tests {
 
         let mut message = create_append_entries_response_data();
         message.success = false;
-        let message = RaftMessage::AppendEntriesResponse(message);
+        let message = messages::RaftMessage::AppendEntriesResponse(message);
 
         let result = message_leader(leader, &message, &String::from("peer 1"), &config, &mut context);
 
@@ -2163,7 +1758,7 @@ mod tests {
 
         let mut context = create_context();
         context.volatile_state.commit_index = Some(0);
-        context.persistent_state.log.push(LogPost { term: context.persistent_state.current_term, value: 17 });
+        context.persistent_state.log.push(data::LogPost { term: context.persistent_state.current_term, value: 17 });
 
         let config = create_config();
 
@@ -2215,58 +1810,58 @@ mod tests {
         }
     }
 
-    fn create_append_entries(term: u64) -> RaftMessage {
+    fn create_append_entries(term: u64) -> messages::RaftMessage {
         let mut data = create_append_entries_data();
         data.term = term;
-        RaftMessage::AppendEntries(data)
+        messages::RaftMessage::AppendEntries(data)
     }
 
-    fn create_append_entries_response(term: u64) -> RaftMessage {
+    fn create_append_entries_response(term: u64) -> messages::RaftMessage {
         let mut data = create_append_entries_response_data();
         data.term = term;
-        RaftMessage::AppendEntriesResponse(data)
+        messages::RaftMessage::AppendEntriesResponse(data)
     }
 
-    fn create_request_vote(term: u64) -> RaftMessage {
+    fn create_request_vote(term: u64) -> messages::RaftMessage {
         let mut data = create_request_vote_data();
         data.term = term;
-        RaftMessage::RequestVote(data)
+        messages::RaftMessage::RequestVote(data)
     }
 
-    fn create_request_vote_response(term: u64) -> RaftMessage {
+    fn create_request_vote_response(term: u64) -> messages::RaftMessage {
         let mut data = create_request_vote_response_data();
         data.term = term;
-        RaftMessage::RequestVoteResponse(data)
+        messages::RaftMessage::RequestVoteResponse(data)
     }
 
-    fn create_append_entries_data() -> AppendEntriesData {
-        AppendEntriesData {
+    fn create_append_entries_data() -> messages::AppendEntriesData {
+        messages::AppendEntriesData {
             term: 5,
             prev_log_index: Some(1),
             prev_log_term: Some(1),
-            entries: vec!(LogPost { term: 5, value: 3 }),
+            entries: vec!(data::LogPost { term: 5, value: 3 }),
             leader_commit: Some(2)
         }
     }
 
-    fn create_append_entries_response_data() -> AppendEntriesResponseData {
-        AppendEntriesResponseData {
+    fn create_append_entries_response_data() -> messages::AppendEntriesResponseData {
+        messages::AppendEntriesResponseData {
             term: 5,
             success: true,
             last_log_index: Some(1)
         }
     }
 
-    fn create_request_vote_data() -> RequestVoteData {
-        RequestVoteData {
+    fn create_request_vote_data() -> messages::RequestVoteData {
+        messages::RequestVoteData {
             term: 6,
             last_log_index: Some(1), 
             last_log_term: Some(1)
         }
     }
 
-    fn create_request_vote_response_data() -> RequestVoteResponseData {
-        RequestVoteResponseData {
+    fn create_request_vote_response_data() -> messages::RequestVoteResponseData {
+        messages::RequestVoteResponseData {
             term: 6,
             vote_granted: true
         }
@@ -2276,7 +1871,7 @@ mod tests {
         Context {
             name: String::from("test"),
             persistent_state: PersistentState {
-                log: vec!(LogPost { term: 1, value: 0 }, LogPost { term: 1, value: 7 }),
+                log: vec!(data::LogPost { term: 1, value: 0 }, data::LogPost { term: 1, value: 7 }),
                 current_term: 5, 
                 voted_for: None
             },
