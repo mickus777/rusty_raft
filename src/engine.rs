@@ -152,15 +152,10 @@ pub mod message_handling {
     }
 
     fn handle_append_entries(role: roles::Role, append_entries: &messages::AppendEntriesData, config: &config::TimeoutConfig, context: &mut context::Context, peer: &String) -> (roles::Role, Vec<messages::DataMessage>) {
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 1:
         if append_entries.term < context.persistent_state.current_term {
             return (role, vec!(messages::DataMessage::new_append_entries_response(&context.persistent_state.current_term, &false, &None, peer)))
         }
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 2:
         if let Some(prev_index) = append_entries.prev_log_index {
             if let Some(prev_term) = append_entries.prev_log_term {
                 if let Some(post) = context.persistent_state.log.get(prev_index) {
@@ -176,12 +171,8 @@ pub mod message_handling {
                 panic!("If there is a previous index, there must also be a previous term.");
             }
         }
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 3 and 4:
         data::append_entries_from(&mut context.persistent_state.log, &append_entries.entries, &append_entries.prev_log_index);
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
         let mut last_log_index = None;
         if context.persistent_state.log.len() > 0 {
@@ -189,8 +180,6 @@ pub mod message_handling {
         }
         let messages = vec!(messages::DataMessage::new_append_entries_response(&context.persistent_state.current_term, &true, &last_log_index, peer));
 
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 5:
         if let Some(leader_commit) = append_entries.leader_commit {
             if let Some(commit_index) = context.volatile_state.commit_index {
                 if leader_commit > commit_index {
@@ -204,7 +193,6 @@ pub mod message_handling {
                 panic!("It should not be possible to have a commit index higher than that of an elected leader");
             }
         }
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
         (roles::Role::new_follower(config, context), messages)
     }
@@ -402,6 +390,28 @@ pub mod message_handling {
             let mut context = create_context();
             context.persistent_state.log.push(data::LogPost { term: 4, value: 17 });
             let (_role, messages) = message_role(roles::Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
+            assert_eq!(context.persistent_state.log, expected);
+            assert_eq!(messages.len(), 1);
+            assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));
+        }
+
+        #[test]
+        fn when_append_entries_given_duplicate_message_then_do_nothing() {
+            let config = create_config();
+
+            let message = messages::RaftMessage::AppendEntries(messages::AppendEntriesData{
+                term: 5,
+                entries: vec!(data::LogPost { term: 5, value: 0 }),
+                leader_commit: None,
+                prev_log_index: None,
+                prev_log_term: None
+            });
+
+            let expected = vec!(data::LogPost { term: 5, value: 0 });
+
+            let mut context = create_context();
+            context.persistent_state.log = vec!(data::LogPost { term: 5, value: 0 });
+            let (_role, messages) = message_role(roles::Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
             assert_eq!(context.persistent_state.log, expected);
             assert_eq!(messages.len(), 1);
             assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::AppendEntriesResponse(messages::AppendEntriesResponseData{ success: true, .. })));

@@ -61,6 +61,10 @@ pub fn append_entries_from(log: &mut Vec<LogPost>, entries: &Vec<LogPost>, start
     } else if log.len() == 0 {
         log.extend(entries.iter().cloned());
         return
+    } else if start_pos.is_none() {
+        log.drain(0..);
+        log.extend(entries.iter().cloned());
+        return
     }
     let mut pos_offset = 0;
     let start_pos : usize = start_pos.unwrap_or_default();
@@ -175,6 +179,18 @@ mod tests {
         let b = Vec::new();
 
         let expected = vec!(LogPost { term: 0, value: 0}, LogPost { term: 0, value: 1}, LogPost { term: 1, value: 2 });
+
+        append_entries_from(&mut a, &b, &None);
+
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn when_append_entries_from_given_duplicate_posts_then_do_nothing() {
+        let mut a = vec!(LogPost { term: 0, value: 0 });
+        let b = vec!(LogPost { term: 0, value: 0 });
+
+        let expected = vec!(LogPost { term: 0, value: 0 });
 
         append_entries_from(&mut a, &b, &None);
 
