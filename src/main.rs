@@ -50,8 +50,11 @@ fn main() {
 
     let bad_connection = if let Ok(bad) = args.value_of::<bool>("simulated-bad-connection") { bad } else { false };
 
+    let (test1, _test2) = config::Config::new().unwrap();
+    println!("{}", test1.election_timeout_length);
+
     let (timeout_config, mut peers) = match config::Config::new() {
-        Ok((conf, peer)) => (conf, peer),
+        Ok((conf, peers)) => (conf, peers),
         Err(message) => {
             println!("Could not load configuration: {}", message);
             args.full_usage();

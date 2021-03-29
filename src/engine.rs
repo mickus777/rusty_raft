@@ -52,11 +52,7 @@ pub mod message_handling {
             },
             messages::RaftMessage::RequestVote(data) => {
                 debug!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, peer, data.term);
-                if handle_request_vote(&data, &peer, config, context) {
-                    (roles::Role::new_follower(config, context), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, true, &peer)))
-                } else {
-                    (roles::Role::Follower(follower), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
-                }
+                handle_request_vote(roles::Role::Follower(follower), &data, config, context, &peer)
             },
             messages::RaftMessage::RequestVoteResponse(data) => {
                 debug!("F {}: Received misguided RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
@@ -77,8 +73,7 @@ pub mod message_handling {
             },
             messages::RaftMessage::RequestVote(data) => {
                 debug!("C {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
-                let result = handle_request_vote(&data, &peer, config, context);
-                (roles::Role::Candidate(candidate), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, result, &peer)))
+                handle_request_vote(roles::Role::Candidate(candidate), &data, config, context, &peer)
             },
             messages::RaftMessage::RequestVoteResponse(data) => {
                 debug!("C {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
@@ -147,12 +142,10 @@ pub mod message_handling {
             },
             messages::RaftMessage::RequestVote(data) => {
                 debug!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
-                let result = handle_request_vote(&data, &peer, config, context);
-                (roles::Role::Leader(leader), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, result, &peer)))
+                handle_request_vote(roles::Role::Leader(leader), &data, config, context, &peer)
             },
             messages::RaftMessage::RequestVoteResponse(data) => {
-                debug!("L {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
-                // Ignore for now
+                debug!("L {}: Misguided RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
                 (roles::Role::Leader(leader), Vec::new())
             }
         }
@@ -216,29 +209,29 @@ pub mod message_handling {
         (roles::Role::new_follower(config, context), messages)
     }
 
-    fn handle_request_vote(data: &messages::RequestVoteData, candidate: &String, _config: &config::TimeoutConfig, context: &mut context::Context) -> bool {
+    fn handle_request_vote(role: roles::Role, data: &messages::RequestVoteData, config: &config::TimeoutConfig, context: &mut context::Context, peer: &String) -> (roles::Role, Vec<messages::DataMessage>) {
         //////////////////////////////////////////////////////////////////////////////////////////////
         // Receiver rule 1:
         if data.term < context.persistent_state.current_term {
-            return false
+            return (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
         } 
         //////////////////////////////////////////////////////////////////////////////////////////////
 
         //////////////////////////////////////////////////////////////////////////////////////////////
         // Receiver rule 2:
         if let Some(voted_for) = &context.persistent_state.voted_for {
-            if voted_for != candidate {
-                return false
+            if voted_for != peer {
+                return (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
             }
         }
         let result = data::check_last_log_post(&data.last_log_index, &data.last_log_term, &context.persistent_state.log);
         //////////////////////////////////////////////////////////////////////////////////////////////
 
         if result {
-            context.persistent_state.voted_for = Some(candidate.clone());
-            result
+            context.persistent_state.voted_for = Some(peer.clone());
+            (roles::Role::new_follower(config, context), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, true, &peer)))
         } else {
-            result
+            (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
         }
     }
 
@@ -617,12 +610,12 @@ pub mod message_handling {
             assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
 
             let (role, messages) = message_role(roles::Role::Candidate(create_candidate_data()), &message, &String::from("other"), &config, &mut context);
-            assert!(matches!(role, roles::Role::Candidate(..)));
+            assert!(matches!(role, roles::Role::Follower(..)));
             assert_eq!(messages.len(), 1);
             assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
 
             let (role, messages) = message_role(roles::Role::Leader(create_leader_data()), &message, &String::from("other"), &config, &mut context);
-            assert!(matches!(role, roles::Role::Leader(..)));
+            assert!(matches!(role, roles::Role::Follower(..)));
             assert_eq!(messages.len(), 1);
             assert!(matches!(messages.get(0).unwrap().raft_message, messages::RaftMessage::RequestVoteResponse(messages::RequestVoteResponseData{ vote_granted: true, term: 5 })));
         }

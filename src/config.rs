@@ -28,16 +28,17 @@ impl ::std::default::Default for Config {
 
 impl Config {
     pub fn new() -> Result<(TimeoutConfig, HashMap<String, String>), String> {
-        let conf : Result<(Config, HashMap<String, String>), confy::ConfyError> = confy::load("rusty_raft");
+        let conf : Result<Config, confy::ConfyError> = confy::load("rusty_raft");
 
         match conf {
-            Ok((config, peers)) => {
+            Ok(config) => {
                 Ok((TimeoutConfig {
                     election_timeout_length: config.election_timeout_length,
                     idle_timeout_length: config.idle_timeout_length
-                }, peers))
+                }, config.peers))
             },
             Err(err) => {
+                println!("hello {}", err);
                 Err(err.to_string())
             }
         }

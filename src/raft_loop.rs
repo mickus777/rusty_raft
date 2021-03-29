@@ -29,7 +29,7 @@ impl RaftLoop {
         let close_flag_copy = close_flag.clone();
 
         RaftLoop {
-            handle: Some(thread::spawn(move || { main_loop(name, close_flag_copy, inbound_channel, outbound_channel, log_channel, config, peers); })),
+            handle: Some(thread::spawn(move || { raft_loop(name, close_flag_copy, inbound_channel, outbound_channel, log_channel, config, peers); })),
             close_flag: close_flag
         }
     }
@@ -56,7 +56,7 @@ impl Drop for RaftLoop {
     }
 }
 
-fn main_loop(name: String, 
+fn raft_loop(name: String, 
     close_flag: Arc<Mutex<bool>>,
     inbound_channel: mpsc::Receiver<messages::DataMessage>, 
     outbound_channel: mpsc::Sender<messages::DataMessage>, 
@@ -70,7 +70,7 @@ fn main_loop(name: String,
 
     loop {
         if *close_flag.lock().unwrap() {
-            info!("UDP Connection exiting!");
+            info!("Raft loop exiting!");
             break;
         }
 
