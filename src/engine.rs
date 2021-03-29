@@ -61,7 +61,7 @@ pub mod message_handling {
         }
     }
 
-    fn message_candidate(mut candidate: roles::CandidateData, raft_message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+    fn message_candidate(candidate: roles::CandidateData, raft_message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
         match raft_message {
             messages::RaftMessage::AppendEntries(data) => {
                 debug!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, peer, data.term);
@@ -77,22 +77,12 @@ pub mod message_handling {
             },
             messages::RaftMessage::RequestVoteResponse(data) => {
                 debug!("C {}: RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
-                if data.term > context.persistent_state.current_term {
-                    context.persistent_state.current_term = data.term;
-                    context.persistent_state.voted_for = None;
-                    (roles::Role::new_follower(config, context), Vec::new())
-                } else {
-                    candidate.peers_undecided.retain(|undecided| *undecided != *peer);
-                    if data.vote_granted {
-                        candidate.peers_approving.push(peer.clone());
-                    }
-                    (roles::Role::Candidate(candidate), Vec::new())
-                }
+                handle_request_vote_response(candidate, &data, &peer)
             }
         }
     }
 
-    fn message_leader(mut leader: roles::LeaderData, raft_message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+    fn message_leader(leader: roles::LeaderData, raft_message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
         match raft_message {
             messages::RaftMessage::AppendEntries(data) => {
                 debug!("L {}: AppendEntries from {} with term {}", context.persistent_state.current_term, peer, data.term);
@@ -100,45 +90,7 @@ pub mod message_handling {
             },
             messages::RaftMessage::AppendEntriesResponse(data) => {
                 debug!("L {}: AppendEntriesResponse from {} with {} term {}", context.persistent_state.current_term, peer, data.success, data.term);
-                if data.term > context.persistent_state.current_term {
-                    context.persistent_state.current_term = data.term;
-                    context.persistent_state.voted_for = None;
-                    (roles::Role::new_follower(config, context), Vec::new())
-                } else {
-                    //////////////////////////////////////////////////////////////////////////////////
-                    // Rule: Leader 3 part 2
-                    let mut messages = Vec::new();
-                    if data.success {
-                        if let Some(index) = data.last_log_index {
-                            leader.next_index.insert(peer.clone(), index + 1);
-                        }
-                        leader.match_index.insert(peer.clone(), data.last_log_index);
-                    } else {
-                        if let Some(next_index) = leader.next_index.get(peer) {
-                            if *next_index > 0 {
-                                let new_next_index = next_index - 1;
-                                leader.next_index.insert(peer.clone(), new_next_index);
-                                if new_next_index > 0 {
-                                    if let Some(post) = context.persistent_state.log.get(new_next_index - 1) {
-                                        messages.push(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &Some(new_next_index - 1), &Some(post.term), &context.persistent_state.log[new_next_index..].iter().cloned().collect(), &context.volatile_state.commit_index, peer));
-                                    } else {
-                                        panic!("Since new_next_index is at least zero there must be something in the log.");
-                                    }
-                                } else {
-                                    messages.push(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer));
-                                }
-                            } else {
-                                leader.next_index.remove(peer);
-                                messages.push(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer));
-                            }
-                        } else {
-                            panic!("We should not fail here, there is no prior data");
-                        }
-                    }
-                    //////////////////////////////////////////////////////////////////////////////////
-
-                    (roles::Role::Leader(leader), messages)
-                }
+                handle_append_entries_response(leader, data, context, peer)
             },
             messages::RaftMessage::RequestVote(data) => {
                 debug!("L {}: RequestVote from {} with term {}", context.persistent_state.current_term, peer, data.term);
@@ -162,6 +114,8 @@ pub mod message_handling {
                     if post.term != prev_term {
                         // Log contains an entry at leader's previous index but its term is not the same as that of the leader
                         return (role, vec!(messages::DataMessage::new_append_entries_response(&context.persistent_state.current_term, &false, &None, peer)))
+                    } else {
+                        // Log term at previous index matches the that of the leader, attach entries at that point
                     }
                 } else {
                     // Log does not contain an entry at leader's previous index
@@ -170,50 +124,81 @@ pub mod message_handling {
             } else {
                 panic!("If there is a previous index, there must also be a previous term.");
             }
+        } else {
+            // These entries are the first of the leader's, just replace our log with them
         }
-
         data::append_entries_from(&mut context.persistent_state.log, &append_entries.entries, &append_entries.prev_log_index);
+
+        if let Some(leader_commit) = append_entries.leader_commit {
+            if let Some(commit_index) = context.volatile_state.commit_index {
+                if leader_commit > commit_index {
+                    // Leader has higher commit index, increase ours
+                    context.volatile_state.commit_index = Some(cmp::min(leader_commit, context.persistent_state.log.len() - 1));
+                } else {
+                    // Apparantly we already have the same commit index as the leader
+                }
+            } else {
+                // We have no commit index yet
+                context.volatile_state.commit_index = Some(cmp::min(leader_commit, context.persistent_state.log.len() - 1));
+            }
+        } else {
+            if let Some(_) = context.volatile_state.commit_index {
+                panic!("It should not be possible to have a commit index higher than that of an elected leader");
+            }
+        }
 
         let mut last_log_index = None;
         if context.persistent_state.log.len() > 0 {
             last_log_index = Some(context.persistent_state.log.len() - 1);
         }
-        let messages = vec!(messages::DataMessage::new_append_entries_response(&context.persistent_state.current_term, &true, &last_log_index, peer));
 
-        if let Some(leader_commit) = append_entries.leader_commit {
-            if let Some(commit_index) = context.volatile_state.commit_index {
-                if leader_commit > commit_index {
-                    context.volatile_state.commit_index = Some(cmp::min(leader_commit, context.persistent_state.log.len() - 1));
-                }
-            } else {
-                context.volatile_state.commit_index = Some(leader_commit);
+        (roles::Role::new_follower(config, context), vec!(messages::DataMessage::new_append_entries_response(&context.persistent_state.current_term, &true, &last_log_index, peer)))
+    }
+
+    fn handle_append_entries_response(mut leader: roles::LeaderData, data: &messages::AppendEntriesResponseData, context: &mut context::Context, peer: &String) -> (roles::Role, Vec<messages::DataMessage>) {
+        if data.success {
+            if let Some(index) = data.last_log_index {
+                leader.next_index.insert(peer.clone(), index + 1);
             }
-        } else {
-            if append_entries.leader_commit.is_some() {
-                panic!("It should not be possible to have a commit index higher than that of an elected leader");
-            }
+            leader.match_index.insert(peer.clone(), data.last_log_index);
+            return (roles::Role::Leader(leader), Vec::new());
         }
 
-        (roles::Role::new_follower(config, context), messages)
+        let next_index = leader.next_index.get(peer);
+        if next_index.is_none() {
+            panic!("We should not fail here, there is no prior data.");
+        }
+        let next_index = next_index.unwrap();
+
+        if *next_index == 0 {
+            leader.next_index.remove(peer);
+            return (roles::Role::Leader(leader), vec!(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer)))
+        }
+
+        let new_next_index = next_index - 1;
+        leader.next_index.insert(peer.clone(), new_next_index);
+        if new_next_index == 0 {
+            return (roles::Role::Leader(leader), vec!(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &None, &None, &context.persistent_state.log, &context.volatile_state.commit_index, peer)))
+        }
+
+        if let Some(post) = context.persistent_state.log.get(new_next_index - 1) {
+            (roles::Role::Leader(leader), vec!(messages::DataMessage::new_append_entries(&context.persistent_state.current_term, &Some(new_next_index - 1), &Some(post.term), &context.persistent_state.log[new_next_index..].iter().cloned().collect(), &context.volatile_state.commit_index, peer)))
+        } else {
+            panic!("Since new_next_index is at least zero there must be something in the log.");
+        }
     }
 
     fn handle_request_vote(role: roles::Role, data: &messages::RequestVoteData, config: &config::TimeoutConfig, context: &mut context::Context, peer: &String) -> (roles::Role, Vec<messages::DataMessage>) {
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 1:
         if data.term < context.persistent_state.current_term {
             return (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
         } 
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Receiver rule 2:
         if let Some(voted_for) = &context.persistent_state.voted_for {
             if voted_for != peer {
                 return (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
             }
         }
         let result = data::check_last_log_post(&data.last_log_index, &data.last_log_term, &context.persistent_state.log);
-        //////////////////////////////////////////////////////////////////////////////////////////////
 
         if result {
             context.persistent_state.voted_for = Some(peer.clone());
@@ -221,6 +206,14 @@ pub mod message_handling {
         } else {
             (role, vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
         }
+    }
+
+    fn handle_request_vote_response(mut candidate: roles::CandidateData, data: &messages::RequestVoteResponseData, peer: &String) -> (roles::Role, Vec<messages::DataMessage>) {
+        candidate.peers_undecided.retain(|undecided| *undecided != *peer);
+        if data.vote_granted {
+            candidate.peers_approving.push(peer.clone());
+        }
+        (roles::Role::Candidate(candidate), Vec::new())
     }
 
     #[cfg(test)]
@@ -411,6 +404,7 @@ pub mod message_handling {
 
             let mut context = create_context();
             context.persistent_state.log = vec!(data::LogPost { term: 5, value: 0 });
+            context.volatile_state.commit_index = None;
             let (_role, messages) = message_role(roles::Role::Follower(create_follower_data()), &message, &String::from("other"), &config, &mut context);
             assert_eq!(context.persistent_state.log, expected);
             assert_eq!(messages.len(), 1);
