@@ -1007,13 +1007,8 @@ pub mod tick_handling {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    pub fn tick_role(role: roles::Role, 
-        peers: &Vec<String>, 
-        config: &config::TimeoutConfig, 
-        context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+    pub fn tick_role(role: roles::Role, peers: &Vec<String>, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
     
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: All servers 1
         if let Some(commit_index) = context.volatile_state.commit_index {
             if let Some(last_applied) = context.volatile_state.last_applied {
                 if commit_index > last_applied {
@@ -1033,8 +1028,7 @@ pub mod tick_handling {
                 }
             }
         }
-        //////////////////////////////////////////////////////////////////////////////////////////////
-    
+
         match role {
             roles::Role::Follower(data) => {
                 tick_follower(data, peers, config, context)
@@ -1053,12 +1047,9 @@ pub mod tick_handling {
         config: &config::TimeoutConfig, 
         context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
     
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: Followers 2
         if follower.election_timeout.elapsed().as_millis() > follower.election_timeout_length {
             debug!("F {}: Timeout!", context.persistent_state.current_term);
             roles::Role::new_candidate(peers, config, context)
-        //////////////////////////////////////////////////////////////////////////////////////////////
         } else {
             debug!("F {}: Timeout in {}", context.persistent_state.current_term, follower.election_timeout_length - follower.election_timeout.elapsed().as_millis());
             (roles::Role::Follower(follower), Vec::new())
@@ -1070,149 +1061,125 @@ pub mod tick_handling {
         config: &config::TimeoutConfig, 
         context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
     
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: Candidate 2
         if candidate.peers_approving.len() >= peers.len() / 2 {
             info!("C {}: Elected!", context.persistent_state.current_term);
             roles::Role::new_leader(peers, config, context)
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: Candidate 4
         } else if candidate.election_timeout.elapsed().as_millis() > candidate.election_timeout_length {
             debug!("C {}: Timeout!", context.persistent_state.current_term);
             roles::Role::new_candidate(peers, config, context)
-        //////////////////////////////////////////////////////////////////////////////////////////////
         } else {
             debug!("C {}: Timeout in {}", context.persistent_state.current_term, candidate.election_timeout_length - candidate.election_timeout.elapsed().as_millis());
             (roles::Role::Candidate(candidate), Vec::new())
         }
     }
     
-    fn tick_leader(mut leader: roles::LeaderData, 
-        peers: &Vec<String>, 
-        config: &config::TimeoutConfig, 
-        context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+    fn tick_leader(leader: roles::LeaderData, peers: &Vec<String>, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
     
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: Leader 1 part 2
         if leader.idle_timeout.elapsed().as_millis() > leader.idle_timeout_length {
-            let prev_log_term = match utils::top(&context.persistent_state.log) {
-                Some(post) => Some(post.term),
-                None => None
-            };
-            let prev_log_index = match context.persistent_state.log.len() {
-                0 => None,
-                _ => Some(context.persistent_state.log.len() - 1)
-            };
-            if prev_log_term.is_some() {
-                debug!("L {}: Broadcast AppendEntries Idle term: {}, index: {}", context.persistent_state.current_term, prev_log_term.unwrap(), prev_log_index.unwrap());
-            } else {
-                debug!("L {}: Broadcast AppendEntries Idle", context.persistent_state.current_term);
-            }
-            let messages = messages::DataMessage::new_append_entrieses(
-                &context.persistent_state.current_term, 
-                &prev_log_index, 
-                &prev_log_term,
-                &vec!(),
-                &context.volatile_state.commit_index, 
-                peers);
-            let mut next_index = HashMap::new();
-            let mut match_index : HashMap<String, Option<usize>> = HashMap::new();
-            for peer in peers.iter() {
-                if context.persistent_state.log.len() > 0 {
-                    next_index.insert((*peer).clone(), context.persistent_state.log.len() - 1);
-                }
-                match_index.insert((*peer).clone(), None);
-            }
-            (roles::Role::Leader(roles::LeaderData {
-                idle_timeout: Instant::now(),
-                idle_timeout_length: u128::from(config.idle_timeout_length),
-                next_index: next_index,
-                match_index: match_index
-            }), messages)
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        } else {
-            let mut messages = Vec::new();
-            //////////////////////////////////////////////////////////////////////////////////////////
-            // Rule: Leader 3 part 1
-            for peer in peers.iter() {
-                if let Some(next_index) = leader.next_index.get(peer) {
-                    if *next_index < context.persistent_state.log.len() {
-                        let mut prev_log_index = None;
-                        let mut prev_log_term = None;
-                        if *next_index > 0 {
-                            prev_log_index = Some(next_index - 1);
-                            prev_log_term = match context.persistent_state.log.get(*next_index - 1) {
-                                Some(post) => Some(post.term),
-                                None => {
-                                    panic!("Failed to find log entry term of {}", *next_index - 1);
-                                }
-                            };
-                        }
-                        debug!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, data::get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
-                        messages.push(messages::DataMessage::new_append_entries(
-                            &context.persistent_state.current_term, 
-                            &prev_log_index, 
-                            &prev_log_term, 
-                            &data::get_log_range(&Some(*next_index), &context.persistent_state.log), 
-                            &context.volatile_state.commit_index, 
-                            peer))
-                    }
-                } else {
-                    leader.next_index.insert(peer.clone(), context.persistent_state.log.len());
-                }
-            }
-            //////////////////////////////////////////////////////////////////////////////////////////
-    
-            //////////////////////////////////////////////////////////////////////////////////////////
-            // Rule: Leader 4
-            if let Some(commit_index) = context.volatile_state.commit_index {
-                let mut max_possible_commit_index = context.persistent_state.log.len() - 1;
-                while commit_index < max_possible_commit_index && context.persistent_state.log[max_possible_commit_index].term == context.persistent_state.current_term {
-                    let mut peers_with_match_index = 0;
-                    for peer in peers.iter() {
-                        if let Some(index_option) = leader.match_index.get(peer) {
-                            if let Some(index) = index_option {
-                                if *index >= max_possible_commit_index {
-                                    peers_with_match_index += 1;
-                                }
-                            }
-                        }
-                    }
-                    if peers_with_match_index >= peers.len() / 2 {
-                        context.volatile_state.commit_index = Some(max_possible_commit_index);
-                        break;
-                    }
-                    max_possible_commit_index -= 1;
-                }
-            } else if context.persistent_state.log.len() > 0 {
-                let mut max_possible_commit_index = context.persistent_state.log.len() - 1;
-                while context.persistent_state.log[max_possible_commit_index].term == context.persistent_state.current_term {
-                    let mut peers_with_match_index = 0;
-                    for peer in peers.iter() {
-                        if let Some(index_option) = leader.match_index.get(peer) {
-                            if let Some(index) = index_option {
-                                if *index >= max_possible_commit_index {
-                                    peers_with_match_index += 1;
-                                }
-                            }
-                        }
-                    }
-                    if peers_with_match_index >= peers.len() / 2 {
-                        context.volatile_state.commit_index = Some(max_possible_commit_index);
-                        break;
-                    }
-                    if max_possible_commit_index == 0 {
-                        break
-                    } else {
-                        max_possible_commit_index -= 1;
-                    }
-                }
-            }
-            //////////////////////////////////////////////////////////////////////////////////////////
-    
-            (roles::Role::Leader(leader), messages)
+            return send_idle_append_entries(peers, config, context);
         }
+
+        update_commit_index(&leader, peers, context);
+
+        send_personalized_append_entries(leader, peers, context)
+    }
+
+    fn update_commit_index(leader: &roles::LeaderData, peers: &Vec<String>, context: &mut context::Context) {
+
+        let mut max_possible_commit_index = context.persistent_state.log.len() - 1;
+        while (context.volatile_state.commit_index.is_none() || context.volatile_state.commit_index.unwrap() < max_possible_commit_index) &&
+               context.persistent_state.log[max_possible_commit_index].term == context.persistent_state.current_term {
+            let mut peers_with_match_index = 0;
+            for peer in peers.iter() {
+                if let Some(index_option) = leader.match_index.get(peer) {
+                    if let Some(index) = index_option {
+                        if *index >= max_possible_commit_index {
+                            peers_with_match_index += 1;
+                        }
+                    }
+                }
+            }
+            if peers_with_match_index >= peers.len() / 2 {
+                context.volatile_state.commit_index = Some(max_possible_commit_index);
+                break;
+            }
+            if max_possible_commit_index == 0 {
+                break
+            } else {
+                max_possible_commit_index -= 1;
+            }
+        }
+    }
+
+    fn send_idle_append_entries(peers: &Vec<String>, config: &config::TimeoutConfig, context: &context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+        let prev_log_term = match utils::top(&context.persistent_state.log) {
+            Some(post) => Some(post.term),
+            None => None
+        };
+        let prev_log_index = match context.persistent_state.log.len() {
+            0 => None,
+            _ => Some(context.persistent_state.log.len() - 1)
+        };
+        if prev_log_term.is_some() {
+            debug!("L {}: Broadcast AppendEntries Idle term: {}, index: {}", context.persistent_state.current_term, prev_log_term.unwrap(), prev_log_index.unwrap());
+        } else {
+            debug!("L {}: Broadcast AppendEntries Idle", context.persistent_state.current_term);
+        }
+        let messages = messages::DataMessage::new_append_entrieses(
+            &context.persistent_state.current_term, 
+            &prev_log_index, 
+            &prev_log_term,
+            &vec!(),
+            &context.volatile_state.commit_index, 
+            peers);
+        let mut next_index = HashMap::new();
+        let mut match_index : HashMap<String, Option<usize>> = HashMap::new();
+        for peer in peers.iter() {
+            if context.persistent_state.log.len() > 0 {
+                next_index.insert((*peer).clone(), context.persistent_state.log.len() - 1);
+            }
+            match_index.insert((*peer).clone(), None);
+        }
+        return (roles::Role::Leader(roles::LeaderData {
+            idle_timeout: Instant::now(),
+            idle_timeout_length: u128::from(config.idle_timeout_length),
+            next_index: next_index,
+            match_index: match_index
+        }), messages)
+    }
+
+    fn send_personalized_append_entries(mut leader: roles::LeaderData, peers: &Vec<String>, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
+        let mut messages = Vec::new();
+
+        for peer in peers.iter() {
+            if let Some(next_index) = leader.next_index.get(peer) {
+                if *next_index < context.persistent_state.log.len() {
+                    let mut prev_log_index = None;
+                    let mut prev_log_term = None;
+                    if *next_index > 0 {
+                        prev_log_index = Some(next_index - 1);
+                        prev_log_term = match context.persistent_state.log.get(*next_index - 1) {
+                            Some(post) => Some(post.term),
+                            None => {
+                                panic!("Failed to find log entry term of {}", *next_index - 1);
+                            }
+                        };
+                    }
+                    debug!("L {} Send AppendEntries {:?} with previous index: {:?} and previous term: {:?}", context.persistent_state.current_term, data::get_log_range(&Some(*next_index), &context.persistent_state.log), prev_log_index, prev_log_term);
+                    messages.push(messages::DataMessage::new_append_entries(
+                        &context.persistent_state.current_term, 
+                        &prev_log_index, 
+                        &prev_log_term, 
+                        &data::get_log_range(&Some(*next_index), &context.persistent_state.log), 
+                        &context.volatile_state.commit_index, 
+                        peer))
+                }
+            } else {
+                leader.next_index.insert(peer.clone(), context.persistent_state.log.len());
+            }
+        }
+
+        (roles::Role::Leader(leader), messages)
     }
 
     #[cfg(test)]
@@ -1428,10 +1395,7 @@ pub mod log_handling {
                 (role, Vec::new())
             },
             roles::Role::Leader(leader) => {
-                //////////////////////////////////////////////////////////////////////////////////
-                // Rule: Leader 2
                 (leader_receive_log(leader, message.value, context), Vec::new())
-                //////////////////////////////////////////////////////////////////////////////////
             }
         }
     }
