@@ -76,27 +76,41 @@ fn raft_loop(name: String,
 
         debug!("X: {:?}", context.persistent_state.log);
 
-        let (new_role, outbound_messages) = if let Ok(message) = log_channel.try_recv() {
-            engine::log_handling::role_receive_log(role, message, &mut context)
-        } else {
-            if let Ok(message) = inbound_channel.try_recv() {
-                engine::message_handling::message_role(role, &message.raft_message, &message.peer, &config, &mut context)
+        loop {
+            if let Ok(message) = log_channel.try_recv() {
+                let (new_role, outbound_messages) = engine::log_handling::role_receive_log(role, message, &mut context);
+                send_all_messages(outbound_messages, &outbound_channel);
+                role = new_role;
             } else {
-                engine::tick_handling::tick_role(role, &peers, &config, &mut context)
-            }
-        };
-
-        role = new_role;
-
-        for outbound_message in outbound_messages {
-            match outbound_channel.send(outbound_message) {
-                Ok(_) => {},
-                Err(message) => {
-                    panic!("Failed to send message: {:?}", message);
-                }
+                break;
             }
         }
 
+        loop {
+            if let Ok(message) = inbound_channel.try_recv() {
+                let (new_role, outbound_messages) = engine::message_handling::message_role(role, &message.raft_message, &message.peer, &config, &mut context);
+                send_all_messages(outbound_messages, &outbound_channel);
+                role = new_role;
+            } else {
+                break;
+            }
+        }
+
+        let (new_role, outbound_messages) = engine::tick_handling::tick_role(role, &peers, &config, &mut context);
+        send_all_messages(outbound_messages, &outbound_channel);
+        role = new_role;
+
         thread::sleep(Duration::from_millis(1000));
+    }
+}
+
+fn send_all_messages(messages: Vec<messages::DataMessage>, channel: &mpsc::Sender<messages::DataMessage>) {
+    for message in messages {
+        match channel.send(message) {
+            Ok(_) => {},
+            Err(message) => {
+                panic!("Failed to send message: {:?}", message);
+            }
+        }
     }
 }
