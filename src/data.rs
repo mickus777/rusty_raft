@@ -19,6 +19,10 @@ impl std::fmt::Debug for LogPost {
     }
 }
 
+pub fn apply_log_post(_log_post: &LogPost) {
+    // Here we shall apply commmitted log posts to the state machine
+}
+
 pub fn check_last_log_post(last_log_index: &Option<usize>, last_log_term: &Option<u64>, log: &Vec<LogPost>) -> bool {
     if log.len() == 0 {
         last_log_index.is_none() && last_log_term.is_none()
