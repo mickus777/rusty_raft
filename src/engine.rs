@@ -13,8 +13,6 @@ pub mod message_handling {
     use super::*;
     
     pub fn message_role(role: roles::Role, message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
-        //////////////////////////////////////////////////////////////////////////////////////////////
-        // Rule: All servers 2
         let term = messages::get_message_term(&message);
         let mut should_become_follower = false;
         if term > context.persistent_state.current_term {
@@ -22,7 +20,6 @@ pub mod message_handling {
             context.persistent_state.voted_for = None;
             should_become_follower = true;
         }
-        //////////////////////////////////////////////////////////////////////////////////////
 
         let (role, messages) = match role {
             roles::Role::Follower(data) => {
@@ -45,11 +42,13 @@ pub mod message_handling {
 
     fn message_follower(follower: roles::FollowerData, raft_message: &messages::RaftMessage, peer: &String, config: &config::TimeoutConfig, context: &mut context::Context) -> (roles::Role, Vec<messages::DataMessage>) {
         match raft_message {
-            //////////////////////////////////////////////////////////////////////////////////////////
-            // Rule: Followers 1
             messages::RaftMessage::AppendEntries(data) => {
                 debug!("F {}: Received AppendEntries from {} term: {}", context.persistent_state.current_term, peer, data.term);
                 handle_append_entries(roles::Role::Follower(follower), &data, config, context, &peer)
+            },
+            messages::RaftMessage::AppendEntriesResponse(data) => {
+                debug!("F {}: Received misguided AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
+                (roles::Role::Follower(follower), Vec::new())
             },
             messages::RaftMessage::RequestVote(data) => {
                 debug!("F {}: Received RequestVote from {} term: {}", context.persistent_state.current_term, peer, data.term);
@@ -59,15 +58,8 @@ pub mod message_handling {
                     (roles::Role::Follower(follower), vec!(messages::DataMessage::new_request_vote_response(&context.persistent_state.current_term, false, &peer)))
                 }
             },
-            //////////////////////////////////////////////////////////////////////////////////////////
-            messages::RaftMessage::AppendEntriesResponse(data) => {
-                debug!("F {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
-                // Old or misguided message, ignore
-                (roles::Role::Follower(follower), Vec::new())
-            },
             messages::RaftMessage::RequestVoteResponse(data) => {
-                debug!("F {}: Received RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
-                // Old or misguided message, ignore
+                debug!("F {}: Received misguided RequestVoteResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.vote_granted, data.term);
                 (roles::Role::Follower(follower), Vec::new())
             }
         }
@@ -77,14 +69,10 @@ pub mod message_handling {
         match raft_message {
             messages::RaftMessage::AppendEntries(data) => {
                 debug!("C {}: Received append entries from {}, term: {}", context.persistent_state.current_term, peer, data.term);
-                //////////////////////////////////////////////////////////////////////////////////////
-                // Rule: Candidate 3
                 handle_append_entries(roles::Role::Candidate(candidate), &data, config, context, &peer)
-                //////////////////////////////////////////////////////////////////////////////////////
             },
             messages::RaftMessage::AppendEntriesResponse(data) => {
-                debug!("C {}: Received AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
-                // Old or misguided message, ignore
+                debug!("C {}: Received misguided AppendEntriesResponse from {} with {} term: {}", context.persistent_state.current_term, peer, data.success, data.term);
                 (roles::Role::Candidate(candidate), Vec::new())
             },
             messages::RaftMessage::RequestVote(data) => {
